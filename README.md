@@ -1,1 +1,0 @@
-# cryptomind-pro
