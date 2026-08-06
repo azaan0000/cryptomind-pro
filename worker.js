@@ -118,11 +118,13 @@ async function handleConnect(request, env, headers) {
   await env.ACCOUNTS_KV.put(`acct:${userId}:${exchange}`, JSON.stringify(record));
   return new Response(JSON.stringify({ ok: true, exchange }), { headers: { ...headers, "Content-Type": "application/json" } });
 }
+
 async function handleDisconnect(request, env, headers) {
   const { userId, exchange } = await request.json();
   await env.ACCOUNTS_KV.delete(`acct:${userId}:${exchange}`);
   return new Response(JSON.stringify({ ok: true }), { headers: { ...headers, "Content-Type": "application/json" } });
 }
+
 async function handleAccount(request, env, headers) {
   const { userId, exchange } = await request.json();
   const raw = await env.ACCOUNTS_KV.get(`acct:${userId}:${exchange}`);
@@ -144,14 +146,14 @@ async function hmacHex(secret, message) {
 }
 
 async function getBinanceBalance(creds) {
-  const timestamp = Date.now();
-  const query = `timestamp=${timestamp}&recvWindow=5000`;
-  const sig = await hmacHex(creds.apiSecret, query);
-  const r = await fetch(`${FUTURES_BASE}/fapi/v2/account?${query}&signature=${sig}`, { headers: { "X-MBX-APIKEY": creds.apiKey } });
-  const d = await r.json();
+  const d = await futuresSignedRequest(creds, "GET", "/fapi/v2/account", {});
   if (d.code) throw new Error(d.msg || "Binance error");
   return (d.assets || []).filter((a) => parseFloat(a.walletBalance) > 0).map((a) => ({ asset: a.asset, free: a.walletBalance, locked: "0" }));
 }
+
+async function getBybitBalance(creds) { throw new Error("Bybit not configured"); }
+async function getOkxBalance(creds) { throw new Error("OKX not configured"); }
+async function getKucoinBalance(creds) { throw new Error("KuCoin not configured"); }
 
 /* ---------------- Spot Order ---------------- */
 async function handleOrder(request, env, headers) {
@@ -165,11 +167,7 @@ async function handleOrder(request, env, headers) {
   if (!raw) return new Response(JSON.stringify({ error: "Exchange not connected" }), { status: 400, headers: { ...headers, "Content-Type": "application/json" } });
   const creds = JSON.parse(raw);
   try {
-    const timestamp = Date.now();
-    const params = `symbol=${symbol}&side=${side.toUpperCase()}&type=MARKET&quoteOrderQty=${usdAmount}&timestamp=${timestamp}&recvWindow=5000`;
-    const sig = await hmacHex(creds.apiSecret, params);
-    const r = await fetch(`${FUTURES_BASE}/fapi/v1/order?${params}&signature=${sig}`, { method: "POST", headers: { "X-MBX-APIKEY": creds.apiKey } });
-    const d = await r.json();
+    const d = await futuresSignedRequest(creds, "POST", "/fapi/v1/order", { symbol, side: side.toUpperCase(), type: "MARKET", quoteOrderQty: usdAmount });
     if (d.code) throw new Error(d.msg || "Order failed");
     return new Response(JSON.stringify({ ok: true, exchange, result: d }), { headers: { ...headers, "Content-Type": "application/json" } });
   } catch (err) {
@@ -195,7 +193,7 @@ function roundQty(symbol, qty) {
   return (Math.floor(qty * factor) / factor).toFixed(p);
 }
 
-async function futuresSignedRequest(creds, method, path, params) {
+async function futuresSignedRequest(creds, method, path, params = {}) {
   const timestamp = Date.now();
   const query = new URLSearchParams({ ...params, timestamp, recvWindow: 5000 }).toString();
   const sig = await hmacHex(creds.apiSecret, query);
@@ -207,6 +205,9 @@ async function futuresSignedRequest(creds, method, path, params) {
     if (d.code && d.code < 0) throw new Error(d.msg || "Futures API error");
     return d;
   } catch (e) {
+    if (text.includes("<!DOCTYPE") || text.includes("<html")) {
+      throw new Error("Binance Blocked request (HTML Page returned). Please retry.");
+    }
     throw new Error(text.substring(0, 100));
   }
 }
@@ -353,6 +354,60 @@ async function handleFuturesClose(request, env, headers) {
     return new Response(JSON.stringify({ ok: true, result }), { headers: { ...headers, "Content-Type": "application/json" } });
   } catch (err) {
     return new Response(JSON.stringify({ ok: false, error: err.message }), { status: 502, headers: { ...headers, "Content-Type": "application/json" } });
+  }
+}
+
+async function handleFuturesOpenOrders(request, env, headers) {
+  const { userId, exchange, symbol } = await request.json();
+  try {
+    const creds = await getCreds(env, userId, exchange || "binance");
+    const params = symbol ? { symbol } : {};
+    const orders = await futuresSignedRequest(creds, "GET", "/fapi/v1/openOrders", params);
+    return new Response(JSON.stringify({ ok: true, orders }), { headers: { ...headers, "Content-Type": "application/json" } });
+  } catch (err) {
+    return new Response(JSON.stringify({ ok: false, error: err.message, orders: [] }), { status: 502, headers: { ...headers, "Content-Type": "application/json" } });
+  }
+}
+
+async function handleFuturesCancelOrder(request, env, headers) {
+  const { userId, exchange, symbol, orderId } = await request.json();
+  try {
+    const creds = await getCreds(env, userId, exchange || "binance");
+    const result = await futuresSignedRequest(creds, "DELETE", "/fapi/v1/order", { symbol, orderId });
+    return new Response(JSON.stringify({ ok: true, result }), { headers: { ...headers, "Content-Type": "application/json" } });
+  } catch (err) {
+    return new Response(JSON.stringify({ ok: false, error: err.message }), { status: 502, headers: { ...headers, "Content-Type": "application/json" } });
+  }
+}
+
+async function handleFuturesModifySL(request, env, headers) {
+  const { userId, exchange, symbol, side, newSlPrice } = await request.json();
+  try {
+    const creds = await getCreds(env, userId, exchange || "binance");
+    const orders = await futuresSignedRequest(creds, "GET", "/fapi/v1/openOrders", { symbol });
+    const slOrder = (orders || []).find((o) => o.type === "STOP_MARKET");
+    if (slOrder) {
+      await futuresSignedRequest(creds, "DELETE", "/fapi/v1/order", { symbol, orderId: slOrder.orderId });
+    }
+    const exitSide = side === "long" ? "SELL" : "BUY";
+    const newOrder = await futuresSignedRequest(creds, "POST", "/fapi/v1/order", { symbol, side: exitSide, type: "STOP_MARKET", stopPrice: parseFloat(newSlPrice).toString(), closePosition: "true" });
+    return new Response(JSON.stringify({ ok: true, order: newOrder }), { headers: { ...headers, "Content-Type": "application/json" } });
+  } catch (err) {
+    return new Response(JSON.stringify({ ok: false, error: err.message }), { status: 502, headers: { ...headers, "Content-Type": "application/json" } });
+  }
+}
+
+async function handleFuturesIncome(request, env, headers) {
+  const { userId, exchange, symbol, incomeType, limit } = await request.json();
+  try {
+    const creds = await getCreds(env, userId, exchange || "binance");
+    const params = { limit: limit || 50 };
+    if (symbol) params.symbol = symbol;
+    if (incomeType) params.incomeType = incomeType;
+    const income = await futuresSignedRequest(creds, "GET", "/fapi/v1/income", params);
+    return new Response(JSON.stringify({ ok: true, income }), { headers: { ...headers, "Content-Type": "application/json" } });
+  } catch (err) {
+    return new Response(JSON.stringify({ ok: false, error: err.message, income: [] }), { status: 502, headers: { ...headers, "Content-Type": "application/json" } });
   }
 }
 
