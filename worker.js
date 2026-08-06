@@ -123,16 +123,11 @@ async function handleConnect(request, env, headers) {
   }
   const record = { apiKey, apiSecret, passphrase: passphrase || null, connectedAt: Date.now() };
 
-  // Verify the key actually works BEFORE saving it — a bad/fake key must
-  // never be reported as "Connected". We hit the Futures account endpoint
-  // since that's what real trading needs (also confirms Futures + Reading
-  // permission is enabled, not just spot access).
   try {
     if (exchange === "binance") {
       const acct = await futuresSignedRequest(record, "GET", "/fapi/v2/account", {});
       if (!acct || acct.code) throw new Error(acct?.msg || "Verification failed");
     } else {
-      // Fallback for other exchanges: use the existing spot balance check.
       if (exchange === "bybit") await getBybitBalance(record);
       else if (exchange === "okx") await getOkxBalance(record);
       else if (exchange === "kucoin") await getKucoinBalance(record);
@@ -180,7 +175,7 @@ async function getBinanceBalance(creds) {
   return (d.balances || []).filter((b) => parseFloat(b.free) + parseFloat(b.locked) > 0).map((b) => ({ asset: b.asset, free: b.free, locked: b.locked }));
 }
 
-/* ---------------- Spot Order (unleveraged, legacy — kept for compatibility) ---------------- */
+/* ---------------- Spot Order ---------------- */
 async function handleOrder(request, env, headers) {
   const { userId, exchange, symbol, side, usdAmount, confirm } = await request.json();
   if (!userId || !exchange || !symbol || !side || !usdAmount) return new Response(JSON.stringify({ error: "Missing fields" }), { status: 400, headers: { ...headers, "Content-Type": "application/json" } });
@@ -205,11 +200,10 @@ async function handleOrder(request, env, headers) {
 }
 
 /* ================================================================
-   FUTURES TRADING — leverage + auto SL/TP that live on Binance's
-   servers (still trigger even if this browser tab is closed).
+   FUTURES TRADING — Routed via Render Proxy Server
    ================================================================ */
 
-const FUTURES_BASE = "https://fapi.binance.com";
+const FUTURES_BASE = "https://cryptomind-pro.onrender.com";
 
 const QTY_PRECISION = {
   BTCUSDT: 3, ETHUSDT: 3, BNBUSDT: 2, SOLUSDT: 1, XRPUSDT: 1, ADAUSDT: 0,
@@ -254,10 +248,7 @@ async function handleFuturesLeverage(request, env, headers) {
 async function handleFuturesOrder(request, env, headers) {
   const {
     userId, exchange, symbol, side, marginUsd, leverage, slPrice, confirm,
-    tpPrice,                 // legacy single TP (still supported)
-    tp1Price, tp1Percent,    // partial TP stage 1 (percent of position to close, default 50)
-    tp2Price,                // partial TP stage 2 (closes the remainder)
-    indicators, note,        // optional context to save in the trade journal
+    tpPrice, tp1Price, tp1Percent, tp2Price, indicators, note,
   } = await request.json();
   if (!userId || !symbol || !side || !marginUsd || !leverage) {
     return new Response(JSON.stringify({ error: "Missing fields" }), { status: 400, headers: { ...headers, "Content-Type": "application/json" } });
@@ -293,8 +284,6 @@ async function handleFuturesOrder(request, env, headers) {
     const results = { entry: entryOrder };
     const exitSide = side === "buy" ? "SELL" : "BUY";
 
-    // SL always closes whatever remains of the position (works fine even
-    // after a partial TP has already reduced the size).
     if (slPrice) {
       try {
         results.stopLoss = await futuresSignedRequest(creds, "POST", "/fapi/v1/order", { symbol, side: exitSide, type: "STOP_MARKET", stopPrice: parseFloat(slPrice).toString(), closePosition: "true" });
@@ -309,11 +298,6 @@ async function handleFuturesOrder(request, env, headers) {
     };
 
     if (tp1Price && tp2Price) {
-      // ---- Partial TP (two-stage exit): TP1 closes a % of the position at
-      // a nearer target, TP2 closes the rest further out. Each is placed as
-      // its own reduceOnly TAKE_PROFIT_MARKET order with an explicit
-      // quantity (Binance's closePosition:true only supports ONE TP, so
-      // partial exits need quantity-based orders instead).
       const pct1 = Math.min(Math.max(parseFloat(tp1Percent) || 50, 1), 99);
       const qty1 = roundQty(symbol, parseFloat(qty) * (pct1 / 100));
       const qty2raw = parseFloat(qty) - parseFloat(qty1);
@@ -346,7 +330,7 @@ async function handleFuturesOrder(request, env, headers) {
     try {
       const tradeId = await saveTradeJournal(env, userId, journal);
       results.tradeId = tradeId;
-    } catch (e) { /* journal is best-effort — never block the actual trade on it */ }
+    } catch (e) {}
 
     return new Response(JSON.stringify({ ok: true, qty, entryPrice: currentPrice, ...results }), { headers: { ...headers, "Content-Type": "application/json" } });
   } catch (err) {
@@ -390,10 +374,7 @@ async function handleFuturesClose(request, env, headers) {
 }
 
 /* ================================================================
-   TRADE JOURNAL — logs every trade the bot places, and lets it be
-   reconciled against Binance later so you can review what worked
-   and what didn't. This is a review/insights tool, NOT an
-   auto-adjusting AI — nothing here changes future trades by itself.
+   TRADE JOURNAL
    ================================================================ */
 
 async function getTradeIndex(env, userId) {
@@ -407,14 +388,11 @@ async function saveTradeJournal(env, userId, journal) {
   await env.ACCOUNTS_KV.put(`trade:${userId}:${id}`, JSON.stringify(journal));
   const index = await getTradeIndex(env, userId);
   index.unshift(id);
-  if (index.length > 300) index.length = 300; // keep the KV bounded
+  if (index.length > 300) index.length = 300;
   await env.ACCOUNTS_KV.put(`trades_index:${userId}`, JSON.stringify(index));
   return id;
 }
 
-// Marks the most recent OPEN journal entry for a symbol as closed. Used for
-// manual closes where we don't know the exact exit price from Binance's
-// response alone — /trade-sync fills in the accurate realized PnL later.
 async function closeJournalForSymbol(env, userId, symbol, reason) {
   const index = await getTradeIndex(env, userId);
   for (const id of index) {
@@ -447,10 +425,6 @@ async function handleTradeHistory(request, env, headers) {
   }
 }
 
-// Call this periodically from the frontend (e.g. on dashboard load / every
-// few minutes). It checks each OPEN journal entry against Binance: if the
-// position for that symbol is flat again, the SL/TP order status tells us
-// which one fired, and /fapi/v1/income gives the real realized PnL.
 async function handleTradeSync(request, env, headers) {
   const { userId, exchange } = await request.json();
   try {
@@ -468,10 +442,8 @@ async function handleTradeSync(request, env, headers) {
       if (t.status !== "open") continue;
 
       const stillOpen = (openQtyBySymbol[t.symbol] || 0) > 0;
-      if (stillOpen) continue; // position not flat yet, nothing to reconcile
+      if (stillOpen) continue;
 
-      // Position is flat — figure out which order closed it and pull the
-      // realized PnL Binance actually booked for this symbol since entry.
       let reason = "unknown";
       try {
         if (t.slOrderId) {
@@ -486,7 +458,7 @@ async function handleTradeSync(request, env, headers) {
           const o = await futuresSignedRequest(creds, "GET", "/fapi/v1/order", { symbol: t.symbol, orderId: t.tp1?.orderId || t.tpOrderId });
           if (o.status === "FILLED") reason = t.tp1 ? "tp1" : "tp";
         }
-      } catch (e) { /* order lookup can fail if it expired off Binance's books — keep reason "unknown" */ }
+      } catch (e) {}
 
       let realizedPnl = null;
       try {
@@ -507,8 +479,6 @@ async function handleTradeSync(request, env, headers) {
   }
 }
 
-// Plain-number pattern breakdown — no ML, just grouping closed trades by
-// what was true at entry so you can see what has actually worked.
 async function handleTradeInsights(request, env, headers) {
   const { userId } = await request.json();
   try {
