@@ -198,32 +198,30 @@ async function futuresSignedRequest(creds, method, path, params = {}) {
   const query = new URLSearchParams({ ...params, timestamp, recvWindow: 5000 }).toString();
   const sig = await hmacHex(creds.apiSecret, query);
   const url = `${FUTURES_BASE}${path}?${query}&signature=${sig}`;
-  
-  const headers = { 
-    "X-MBX-APIKEY": creds.apiKey,
-    "User-Agent": "Mozilla/5.0",
-    "Accept": "application/json"
-  };
 
-  let r;
-  for (let attempt = 0; attempt < 3; attempt++) {
-    try {
-      r = await fetch(url, { method, headers });
-      const text = await r.text();
-      
-      if (!text.includes("<!DOCTYPE") && !text.includes("<html")) {
-        const d = JSON.parse(text);
-        if (d.code && d.code < 0) throw new Error(d.msg || "Futures API error");
-        return d;
-      }
-    } catch (e) {
-      if (e.message.includes("Futures API error")) throw e;
+  const response = await fetch(url, {
+    method,
+    headers: {
+      "X-MBX-APIKEY": creds.apiKey,
+      "User-Agent": "Mozilla/5.0",
+      "Accept": "application/json"
     }
-    await new Promise(res => setTimeout(res, 2500));
+  });
+
+  const text = await response.text();
+  
+  try {
+    const data = JSON.parse(text);
+    if (data.code && data.code < 0) {
+      // Direct exact Binance error text return karein
+      throw new Error(`Binance (${data.code}): ${data.msg}`);
+    }
+    return data;
+  } catch (err) {
+    throw new Error(err.message || text);
+  }
   }
 
-  throw new Error("Render Proxy response error. Please try clicking Connect once more.");
-}
 
 
 
