@@ -1,5 +1,5 @@
 /**
- * CryptoMind PRO — Cloudflare Worker Backend (Direct Binance Connection - No Render Proxy Needed)
+ * CryptoMind PRO — Cloudflare Worker Backend (Direct Binance Connection with WAF Failover)
  */
 
 const ALLOWED_ORIGINS = [
@@ -18,7 +18,13 @@ function corsHeaders(origin) {
   };
 }
 
-const FUTURES_BASE = "https://fapi.binance.com";
+const BINANCE_ENDPOINTS = [
+  "https://fapi.binance.com",
+  "https://fapi1.binance.com",
+  "https://fapi2.binance.com",
+  "https://fapi3.binance.com",
+  "https://fapi.binance.me"
+];
 
 export default {
   async fetch(request, env) {
@@ -61,37 +67,44 @@ async function hmacHex(secret, message) {
   return [...new Uint8Array(sig)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-/* ---------------- Direct Binance Signed Request ---------------- */
+/* ---------------- Multi-Endpoint Binance Signed Request ---------------- */
 async function futuresSignedRequest(creds, method, path, params = {}) {
   const timestamp = Date.now();
   const query = new URLSearchParams({ ...params, timestamp, recvWindow: 5000 }).toString();
   const sig = await hmacHex(creds.apiSecret, query);
-  const url = `${FUTURES_BASE}${path}?${query}&signature=${sig}`;
+  
+  let lastError = null;
 
-  const res = await fetch(url, {
-    method,
-    headers: {
-      "X-MBX-APIKEY": creds.apiKey,
-      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-      "Accept": "application/json"
+  for (const base of BINANCE_ENDPOINTS) {
+    try {
+      const url = `${base}${path}?${query}&signature=${sig}`;
+      const res = await fetch(url, {
+        method,
+        headers: {
+          "X-MBX-APIKEY": creds.apiKey,
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+          "Accept": "application/json"
+        }
+      });
+
+      const text = await res.text();
+
+      if (text.trim().startsWith("<") || text.includes("<!DOCTYPE") || text.includes("<html")) {
+        lastError = new Error("WAF Block on " + base);
+        continue;
+      }
+
+      const data = JSON.parse(text);
+      if (data.code && data.code < 0) {
+        throw new Error(`Binance API Error (${data.code}): ${data.msg}`);
+      }
+      return data;
+    } catch (err) {
+      lastError = err;
     }
-  });
-
-  const text = await res.text();
-
-  if (text.trim().startsWith("<") || text.includes("<!DOCTYPE")) {
-    throw new Error("Binance Firewall Blocked request. Ensure API Key IP restriction is 'Unrestricted'.");
   }
 
-  try {
-    const data = JSON.parse(text);
-    if (data.code && data.code < 0) {
-      throw new Error(`Binance API Error (${data.code}): ${data.msg}`);
-    }
-    return data;
-  } catch (err) {
-    throw new Error(err.message || "Failed to parse Binance response");
-  }
+  throw new Error("Binance Connection Failed: " + (lastError ? lastError.message : "All endpoints blocked"));
 }
 
 /* ---------------- AI Report ---------------- */
@@ -215,7 +228,7 @@ async function handleFuturesOrder(request, env, headers) {
     const creds = await getCreds(env, userId, exchange || "binance");
     await futuresSignedRequest(creds, "POST", "/fapi/v1/leverage", { symbol, leverage });
 
-    const priceResp = await fetch(`${FUTURES_BASE}/fapi/v1/ticker/price?symbol=${symbol}`);
+    const priceResp = await fetch(`${BINANCE_ENDPOINTS[0]}/fapi/v1/ticker/price?symbol=${symbol}`);
     const priceData = await priceResp.json();
     const currentPrice = parseFloat(priceData.price);
 
