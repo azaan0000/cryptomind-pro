@@ -203,24 +203,29 @@ async function futuresSignedRequest(creds, method, path, params = {}) {
     method,
     headers: {
       "X-MBX-APIKEY": creds.apiKey,
-      "User-Agent": "Mozilla/5.0",
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
       "Accept": "application/json"
     }
   });
 
   const text = await response.text();
-  
+
+  // Safety check: Agar response JSON nahi balki HTML hai
+  if (text.trim().startsWith("<") || text.includes("<!DOCTYPE")) {
+    throw new Error("Render Proxy waking up or blocked by firewall. Tap Connect again.");
+  }
+
   try {
     const data = JSON.parse(text);
     if (data.code && data.code < 0) {
-      // Direct exact Binance error text return karein
-      throw new Error(`Binance (${data.code}): ${data.msg}`);
+      throw new Error(`Binance API Error (${data.code}): ${data.msg}`);
     }
     return data;
   } catch (err) {
-    throw new Error(err.message || text);
+    throw new Error(err.message || "Failed to parse Binance response.");
   }
-  }
+}
+
 
 
 
