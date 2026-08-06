@@ -1,0 +1,10 @@
+{
+  "name": "cryptomind-pro-backend",
+  "private": true,
+  "scripts": {
+    "build": "echo build-ok"
+  },
+  "devDependencies": {
+    "wrangler": "^3.90.0"
+  }
+}
