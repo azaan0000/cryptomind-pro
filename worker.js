@@ -59,22 +59,36 @@ async function hmacHex(secret, message) {
   return [...new Uint8Array(sig)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-/* ---------------- WAF-Bypass Binance Signed Request ---------------- */
+/* ---------------- WAF & POST Proxy Compatible Request ---------------- */
 async function futuresSignedRequest(creds, method, path, params = {}) {
   const timestamp = Date.now();
   const query = new URLSearchParams({ ...params, timestamp, recvWindow: 5000 }).toString();
   const sig = await hmacHex(creds.apiSecret, query);
   
   const targetUrl = `https://fapi.binance.com${path}?${query}&signature=${sig}`;
-  const proxyUrl = `https://corsproxy.io/?${encodeURIComponent(targetUrl)}`;
 
-  const res = await fetch(proxyUrl, {
-    method,
-    headers: {
-      "X-MBX-APIKEY": creds.apiKey,
-      "Content-Type": "application/json"
-    }
-  });
+  // Direct fetch with customized headers to prevent WAF HTML block
+  let res;
+  try {
+    res = await fetch(targetUrl, {
+      method,
+      headers: {
+        "X-MBX-APIKEY": creds.apiKey,
+        "Content-Type": "application/x-www-form-urlencoded",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+      }
+    });
+  } catch (e) {
+    // Proxy Fallback if direct fetch fails
+    const proxyUrl = `https://corsproxy.io/?${encodeURIComponent(targetUrl)}`;
+    res = await fetch(proxyUrl, {
+      method,
+      headers: {
+        "X-MBX-APIKEY": creds.apiKey,
+        "Content-Type": "application/json"
+      }
+    });
+  }
 
   const text = await res.text();
 
