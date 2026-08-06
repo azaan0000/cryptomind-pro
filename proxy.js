@@ -13,3 +13,13 @@ app.use('/', createProxyMiddleware({
 }));
 
 app.listen(PORT, () => console.log(`Proxy server running on port ${PORT}`));
+// IP check endpoint
+app.get('/my-ip', async (req, res) => {
+  try {
+    const response = await fetch('https://api.ipify.org?format=json');
+    const data = await response.json();
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
