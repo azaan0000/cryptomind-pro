@@ -1,5 +1,5 @@
 /**
- * CryptoMind PRO — Cloudflare Worker Backend (Direct Binance Connection with WAF Failover)
+ * CryptoMind PRO — Cloudflare Worker Backend (Bypass WAF Proxy Engine)
  */
 
 const ALLOWED_ORIGINS = [
@@ -17,14 +17,6 @@ function corsHeaders(origin) {
     "Access-Control-Allow-Headers": "Content-Type, X-MBX-APIKEY",
   };
 }
-
-const BINANCE_ENDPOINTS = [
-  "https://fapi.binance.com",
-  "https://fapi1.binance.com",
-  "https://fapi2.binance.com",
-  "https://fapi3.binance.com",
-  "https://fapi.binance.me"
-];
 
 export default {
   async fetch(request, env) {
@@ -66,16 +58,14 @@ async function hmacHex(secret, message) {
   const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(message));
   return [...new Uint8Array(sig)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
-/* ---------------- Updated Direct Binance Request (WAF Bypass Layer) ---------------- */
+
+/* ---------------- WAF-Bypass Binance Signed Request ---------------- */
 async function futuresSignedRequest(creds, method, path, params = {}) {
   const timestamp = Date.now();
   const query = new URLSearchParams({ ...params, timestamp, recvWindow: 5000 }).toString();
   const sig = await hmacHex(creds.apiSecret, query);
   
-  // Using direct Binance API endpoint via custom bypass headers
   const targetUrl = `https://fapi.binance.com${path}?${query}&signature=${sig}`;
-  
-  // Primary attempt via origin proxy stream
   const proxyUrl = `https://corsproxy.io/?${encodeURIComponent(targetUrl)}`;
 
   const res = await fetch(proxyUrl, {
@@ -89,7 +79,7 @@ async function futuresSignedRequest(creds, method, path, params = {}) {
   const text = await res.text();
 
   if (text.trim().startsWith("<") || text.includes("<!DOCTYPE") || text.includes("<html")) {
-    throw new Error("Binance API Blocked. Please check API Key IP Settings.");
+    throw new Error("Binance Firewall Blocked request. Ensure API Key IP restriction is set to Unrestricted.");
   }
 
   try {
@@ -99,10 +89,9 @@ async function futuresSignedRequest(creds, method, path, params = {}) {
     }
     return data;
   } catch (err) {
-    throw new Error("Failed to parse Binance response: " + err.message);
+    throw new Error("Invalid Binance response: " + err.message);
   }
 }
-
 
 /* ---------------- AI Report ---------------- */
 const PROTRADER_SYSTEM_PROMPT = `You are "ProTrader-AI," an elite institutional-grade trading analyst. Analyze the market data given and respond like a top professional trader — no hype, precise numbers. Rules: 1) State trend clearly. 2) Use only the confluence/indicators given, never invent values. 3) Risk:Reward must be at least 1:1.5, SL/TP realistic and tight (intraday distance, not swing-sized). 4) If signal is HOLD, explain what would flip it. 5) Max 160 words, plain text, no markdown. 6) End with exactly: "Not financial advice."`;
@@ -225,7 +214,8 @@ async function handleFuturesOrder(request, env, headers) {
     const creds = await getCreds(env, userId, exchange || "binance");
     await futuresSignedRequest(creds, "POST", "/fapi/v1/leverage", { symbol, leverage });
 
-    const priceResp = await fetch(`${BINANCE_ENDPOINTS[0]}/fapi/v1/ticker/price?symbol=${symbol}`);
+    const targetPriceUrl = `https://fapi.binance.com/fapi/v1/ticker/price?symbol=${symbol}`;
+    const priceResp = await fetch(`https://corsproxy.io/?${encodeURIComponent(targetPriceUrl)}`);
     const priceData = await priceResp.json();
     const currentPrice = parseFloat(priceData.price);
 
