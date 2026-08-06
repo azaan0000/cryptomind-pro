@@ -197,30 +197,23 @@ async function futuresSignedRequest(creds, method, path, params = {}) {
   const timestamp = Date.now();
   const query = new URLSearchParams({ ...params, timestamp, recvWindow: 5000 }).toString();
   const sig = await hmacHex(creds.apiSecret, query);
-  
-  // Custom headers to prevent Render 502/HTML drops
   const url = `${FUTURES_BASE}${path}?${query}&signature=${sig}`;
   
-  let r = await fetch(url, { 
+  const options = { 
     method, 
     headers: { 
       "X-MBX-APIKEY": creds.apiKey,
       "User-Agent": "Mozilla/5.0",
       "Accept": "application/json"
     } 
-  });
+  };
 
-  // Retry once if Render proxy was waking up from cold start
-  if (r.status === 502 || r.status === 503 || r.status === 504) {
+  let r = await fetch(url, options);
+
+  // Agar Render proxy sleep me ho ya first time response na de, toh 2 second wait karke auto-retry karega
+  if (!r.ok || r.status === 502 || r.status === 503) {
     await new Promise(res => setTimeout(res, 2000));
-    r = await fetch(url, { 
-      method, 
-      headers: { 
-        "X-MBX-APIKEY": creds.apiKey,
-        "User-Agent": "Mozilla/5.0",
-        "Accept": "application/json"
-      } 
-    });
+    r = await fetch(url, options);
   }
 
   const text = await r.text();
@@ -235,6 +228,7 @@ async function futuresSignedRequest(creds, method, path, params = {}) {
     throw new Error(text.substring(0, 100));
   }
 }
+
 
 
 async function getCreds(env, userId, exchange) {
