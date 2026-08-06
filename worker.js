@@ -1,5 +1,5 @@
 /**
- * CryptoMind PRO — Cloudflare Worker Backend (Complete WAF Bypass Engine)
+ * CryptoMind PRO — Cloudflare Worker Backend (Direct Headers Bypass)
  */
 
 const ALLOWED_ORIGINS = [
@@ -59,40 +59,29 @@ async function hmacHex(secret, message) {
   return [...new Uint8Array(sig)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-/* ---------------- Robust Binance Request Engine ---------------- */
+/* ---------------- Direct Custom Fetch Engine ---------------- */
 async function futuresSignedRequest(creds, method, path, params = {}) {
   const timestamp = Date.now();
   const query = new URLSearchParams({ ...params, timestamp, recvWindow: 5000 }).toString();
   const sig = await hmacHex(creds.apiSecret, query);
   
   const targetUrl = `https://fapi.binance.com${path}?${query}&signature=${sig}`;
-  const proxyUrl = `https://corsproxy.io/?${encodeURIComponent(targetUrl)}`;
 
-  let text = "";
-  let res;
+  const reqHeaders = {
+    "X-MBX-APIKEY": creds.apiKey,
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "application/json"
+  };
 
-  try {
-    res = await fetch(proxyUrl, {
-      method: method,
-      headers: {
-        "X-MBX-APIKEY": creds.apiKey
-      }
-    });
-    text = await res.text();
-  } catch (e) {
-    // Retry with direct fetch if proxy fails
-    res = await fetch(targetUrl, {
-      method: method,
-      headers: {
-        "X-MBX-APIKEY": creds.apiKey,
-        "User-Agent": "Mozilla/5.0"
-      }
-    });
-    text = await res.text();
-  }
+  const res = await fetch(targetUrl, {
+    method: method,
+    headers: reqHeaders
+  });
+
+  const text = await res.text();
 
   if (text.trim().startsWith("<") || text.includes("<!DOCTYPE") || text.includes("<html")) {
-    throw new Error("Binance API Blocked. Please check API Key IP Settings.");
+    throw new Error("Binance API Blocked. Ensure API Key IP restriction is set to Unrestricted on Binance.");
   }
 
   try {
@@ -226,12 +215,12 @@ async function handleFuturesOrder(request, env, headers) {
   try {
     const creds = await getCreds(env, userId, exchange || "binance");
     
-    // Leverage set
+    // Leverage Set
     await futuresSignedRequest(creds, "POST", "/fapi/v1/leverage", { symbol, leverage });
 
-    // Price fetch via proxy
+    // Price Fetch Direct
     const targetPriceUrl = `https://fapi.binance.com/fapi/v1/ticker/price?symbol=${symbol}`;
-    const priceResp = await fetch(`https://corsproxy.io/?${encodeURIComponent(targetPriceUrl)}`);
+    const priceResp = await fetch(targetPriceUrl, { headers: { "User-Agent": "Mozilla/5.0" } });
     const priceData = await priceResp.json();
     const currentPrice = parseFloat(priceData.price);
 
