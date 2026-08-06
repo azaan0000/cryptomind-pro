@@ -1,28 +1,5 @@
 /**
  * CryptoMind PRO — Cloudflare Worker Backend (v3: Futures + Leverage + Auto SL/TP)
- * -----------------------------------------------------------------------------
- * NEW in this version:
- *   POST /futures-leverage  -> set leverage for a symbol before opening a position
- *   POST /futures-order     -> open a MARKET position + auto-attach SL and TP as
- *                               exchange-side conditional orders (work even if
- *                               browser is closed — Binance's servers handle them)
- *   POST /futures-positions -> list open futures positions with live PnL
- *   POST /futures-close     -> close a position at market price
- *
- * SAFETY (unchanged from before, still enforced):
- *   - MAX_ORDER_USD caps margin per trade (set in Cloudflare Settings -> Variables)
- *   - MAX_LEVERAGE caps leverage allowed (default 20x)
- *   - Withdrawal permission must NEVER be enabled on the API key
- *   - Every order requires confirm:true from the frontend
- *
- * REQUIRED SETUP:
- *   1. Settings -> Variables -> Secrets: ANTHROPIC_API_KEY
- *   2. Settings -> Variables -> plain:  MAX_ORDER_USD = 25  (max margin per trade)
- *   3. Settings -> Variables -> plain:  MAX_LEVERAGE = 20
- *   4. Settings -> Bindings -> KV Namespace: ACCOUNTS_KV
- *   5. On Binance: enable "Reading" + "Enable Futures" on the API key
- *      (NOT "Enable Withdrawals" — ever). Activate Futures + transfer
- *      USDT to Futures wallet once on the Binance app first.
  */
 
 const ALLOWED_ORIGINS = [
@@ -31,7 +8,6 @@ const ALLOWED_ORIGINS = [
   "http://localhost:3000",
   "http://127.0.0.1:5500"
 ];
-
 
 function corsHeaders(origin) {
   const allow = ALLOWED_ORIGINS.includes(origin) ? origin : ALLOWED_ORIGINS[0];
@@ -171,10 +147,10 @@ async function getBinanceBalance(creds) {
   const timestamp = Date.now();
   const query = `timestamp=${timestamp}&recvWindow=5000`;
   const sig = await hmacHex(creds.apiSecret, query);
-  const r = await fetch(`https://api.binance.com/api/v3/account?${query}&signature=${sig}`, { headers: { "X-MBX-APIKEY": creds.apiKey } });
+  const r = await fetch(`${FUTURES_BASE}/fapi/v2/account?${query}&signature=${sig}`, { headers: { "X-MBX-APIKEY": creds.apiKey } });
   const d = await r.json();
   if (d.code) throw new Error(d.msg || "Binance error");
-  return (d.balances || []).filter((b) => parseFloat(b.free) + parseFloat(b.locked) > 0).map((b) => ({ asset: b.asset, free: b.free, locked: b.locked }));
+  return (d.assets || []).filter((a) => parseFloat(a.walletBalance) > 0).map((a) => ({ asset: a.asset, free: a.walletBalance, locked: "0" }));
 }
 
 /* ---------------- Spot Order ---------------- */
@@ -192,7 +168,7 @@ async function handleOrder(request, env, headers) {
     const timestamp = Date.now();
     const params = `symbol=${symbol}&side=${side.toUpperCase()}&type=MARKET&quoteOrderQty=${usdAmount}&timestamp=${timestamp}&recvWindow=5000`;
     const sig = await hmacHex(creds.apiSecret, params);
-    const r = await fetch(`https://api.binance.com/api/v3/order?${params}&signature=${sig}`, { method: "POST", headers: { "X-MBX-APIKEY": creds.apiKey } });
+    const r = await fetch(`${FUTURES_BASE}/fapi/v1/order?${params}&signature=${sig}`, { method: "POST", headers: { "X-MBX-APIKEY": creds.apiKey } });
     const d = await r.json();
     if (d.code) throw new Error(d.msg || "Order failed");
     return new Response(JSON.stringify({ ok: true, exchange, result: d }), { headers: { ...headers, "Content-Type": "application/json" } });
@@ -225,9 +201,14 @@ async function futuresSignedRequest(creds, method, path, params) {
   const sig = await hmacHex(creds.apiSecret, query);
   const url = `${FUTURES_BASE}${path}?${query}&signature=${sig}`;
   const r = await fetch(url, { method, headers: { "X-MBX-APIKEY": creds.apiKey } });
-  const d = await r.json();
-  if (d.code && d.code < 0) throw new Error(d.msg || "Futures API error");
-  return d;
+  const text = await r.text();
+  try {
+    const d = JSON.parse(text);
+    if (d.code && d.code < 0) throw new Error(d.msg || "Futures API error");
+    return d;
+  } catch (e) {
+    throw new Error(text.substring(0, 100));
+  }
 }
 
 async function getCreds(env, userId, exchange) {
