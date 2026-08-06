@@ -1,5 +1,5 @@
 /**
- * CryptoMind PRO — Cloudflare Worker Backend (Bypass WAF Proxy Engine)
+ * CryptoMind PRO — Cloudflare Worker Backend (Complete WAF Bypass Engine)
  */
 
 const ALLOWED_ORIGINS = [
@@ -59,41 +59,40 @@ async function hmacHex(secret, message) {
   return [...new Uint8Array(sig)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-/* ---------------- WAF & POST Proxy Compatible Request ---------------- */
+/* ---------------- Robust Binance Request Engine ---------------- */
 async function futuresSignedRequest(creds, method, path, params = {}) {
   const timestamp = Date.now();
   const query = new URLSearchParams({ ...params, timestamp, recvWindow: 5000 }).toString();
   const sig = await hmacHex(creds.apiSecret, query);
   
   const targetUrl = `https://fapi.binance.com${path}?${query}&signature=${sig}`;
+  const proxyUrl = `https://corsproxy.io/?${encodeURIComponent(targetUrl)}`;
 
-  // Direct fetch with customized headers to prevent WAF HTML block
+  let text = "";
   let res;
+
   try {
-    res = await fetch(targetUrl, {
-      method,
-      headers: {
-        "X-MBX-APIKEY": creds.apiKey,
-        "Content-Type": "application/x-www-form-urlencoded",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-      }
-    });
-  } catch (e) {
-    // Proxy Fallback if direct fetch fails
-    const proxyUrl = `https://corsproxy.io/?${encodeURIComponent(targetUrl)}`;
     res = await fetch(proxyUrl, {
-      method,
+      method: method,
       headers: {
-        "X-MBX-APIKEY": creds.apiKey,
-        "Content-Type": "application/json"
+        "X-MBX-APIKEY": creds.apiKey
       }
     });
+    text = await res.text();
+  } catch (e) {
+    // Retry with direct fetch if proxy fails
+    res = await fetch(targetUrl, {
+      method: method,
+      headers: {
+        "X-MBX-APIKEY": creds.apiKey,
+        "User-Agent": "Mozilla/5.0"
+      }
+    });
+    text = await res.text();
   }
 
-  const text = await res.text();
-
   if (text.trim().startsWith("<") || text.includes("<!DOCTYPE") || text.includes("<html")) {
-    throw new Error("Binance Firewall Blocked request. Ensure API Key IP restriction is set to Unrestricted.");
+    throw new Error("Binance API Blocked. Please check API Key IP Settings.");
   }
 
   try {
@@ -108,7 +107,7 @@ async function futuresSignedRequest(creds, method, path, params = {}) {
 }
 
 /* ---------------- AI Report ---------------- */
-const PROTRADER_SYSTEM_PROMPT = `You are "ProTrader-AI," an elite institutional-grade trading analyst. Analyze the market data given and respond like a top professional trader — no hype, precise numbers. Rules: 1) State trend clearly. 2) Use only the confluence/indicators given, never invent values. 3) Risk:Reward must be at least 1:1.5, SL/TP realistic and tight (intraday distance, not swing-sized). 4) If signal is HOLD, explain what would flip it. 5) Max 160 words, plain text, no markdown. 6) End with exactly: "Not financial advice."`;
+const PROTRADER_SYSTEM_PROMPT = `You are "ProTrader-AI," an elite institutional-grade trading analyst. Analyze the market data given and respond like a top professional trader — no hype, precise numbers. Rules: 1) State trend clearly. 2) Use only the confluence/indicators given, never invent values. 3) Risk:Reward must be at least 1:1.5, SL/TP realistic and tight. 4) Max 160 words, plain text, no markdown. 5) End with: "Not financial advice."`;
 
 async function handleAIReport(request, env, headers) {
   const { symbol, price, indicators, signal, timeframe } = await request.json();
@@ -226,8 +225,11 @@ async function handleFuturesOrder(request, env, headers) {
   }
   try {
     const creds = await getCreds(env, userId, exchange || "binance");
+    
+    // Leverage set
     await futuresSignedRequest(creds, "POST", "/fapi/v1/leverage", { symbol, leverage });
 
+    // Price fetch via proxy
     const targetPriceUrl = `https://fapi.binance.com/fapi/v1/ticker/price?symbol=${symbol}`;
     const priceResp = await fetch(`https://corsproxy.io/?${encodeURIComponent(targetPriceUrl)}`);
     const priceData = await priceResp.json();
