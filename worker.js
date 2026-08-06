@@ -199,34 +199,30 @@ async function futuresSignedRequest(creds, method, path, params = {}) {
   const sig = await hmacHex(creds.apiSecret, query);
   const url = `${FUTURES_BASE}${path}?${query}&signature=${sig}`;
   
-  const options = { 
-    method, 
-    headers: { 
-      "X-MBX-APIKEY": creds.apiKey,
-      "User-Agent": "Mozilla/5.0",
-      "Accept": "application/json"
-    } 
+  const headers = { 
+    "X-MBX-APIKEY": creds.apiKey,
+    "User-Agent": "Mozilla/5.0",
+    "Accept": "application/json"
   };
 
-  let r = await fetch(url, options);
-
-  // Agar Render proxy sleep me ho ya first time response na de, toh 2 second wait karke auto-retry karega
-  if (!r.ok || r.status === 502 || r.status === 503) {
-    await new Promise(res => setTimeout(res, 2000));
-    r = await fetch(url, options);
-  }
-
-  const text = await r.text();
-  try {
-    const d = JSON.parse(text);
-    if (d.code && d.code < 0) throw new Error(d.msg || "Futures API error");
-    return d;
-  } catch (e) {
-    if (text.includes("<!DOCTYPE") || text.includes("<html")) {
-      throw new Error("Render Proxy waking up. Tap Connect again in 5 seconds.");
+  let r;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      r = await fetch(url, { method, headers });
+      const text = await r.text();
+      
+      if (!text.includes("<!DOCTYPE") && !text.includes("<html")) {
+        const d = JSON.parse(text);
+        if (d.code && d.code < 0) throw new Error(d.msg || "Futures API error");
+        return d;
+      }
+    } catch (e) {
+      if (e.message.includes("Futures API error")) throw e;
     }
-    throw new Error(text.substring(0, 100));
+    await new Promise(res => setTimeout(res, 2500));
   }
+
+  throw new Error("Render Proxy response error. Please try clicking Connect once more.");
 }
 
 
