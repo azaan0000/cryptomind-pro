@@ -26,10 +26,12 @@
  */
 
 const ALLOWED_ORIGINS = [
+  "https://cryptomind-pro.pages.dev",
   "https://azaan0000.github.io",
   "http://localhost:3000",
   "http://127.0.0.1:5500"
 ];
+
 
 function corsHeaders(origin) {
   const allow = ALLOWED_ORIGINS.includes(origin) ? origin : ALLOWED_ORIGINS[0];
