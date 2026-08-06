@@ -4,7 +4,7 @@ const { createProxyMiddleware } = require('http-proxy-middleware');
 const app = express();
 const PORT = process.env.PORT || 10000;
 
-// 1. IP Check Endpoint (Isay proxy se pehle rakhna zaroori hai)
+// 1. IP Check Endpoint
 app.get('/my-ip', async (req, res) => {
   try {
     const response = await fetch('https://api.ipify.org?format=json');
@@ -15,12 +15,14 @@ app.get('/my-ip', async (req, res) => {
   }
 });
 
-// 2. Binance Futures Proxy Middleware
+// 2. Binance Futures Proxy Middleware (With Fixed Headers)
 app.use('/', createProxyMiddleware({
     target: 'https://fapi.binance.com',
     changeOrigin: true,
     onProxyReq: (proxyReq, req, res) => {
-        proxyReq.setHeader('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)');
+        proxyReq.setHeader('Host', 'fapi.binance.com');
+        proxyReq.setHeader('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+        proxyReq.setHeader('Accept', 'application/json');
     }
 }));
 
