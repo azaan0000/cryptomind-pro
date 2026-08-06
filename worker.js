@@ -206,7 +206,7 @@ async function futuresSignedRequest(creds, method, path, params = {}) {
     return d;
   } catch (e) {
     if (text.includes("<!DOCTYPE") || text.includes("<html")) {
-      throw new Error("Binance Blocked request (HTML Page returned). Please retry.");
+      throw new Error("Proxy server loading/error. Please retry in 10 seconds.");
     }
     throw new Error(text.substring(0, 100));
   }
