@@ -197,8 +197,32 @@ async function futuresSignedRequest(creds, method, path, params = {}) {
   const timestamp = Date.now();
   const query = new URLSearchParams({ ...params, timestamp, recvWindow: 5000 }).toString();
   const sig = await hmacHex(creds.apiSecret, query);
+  
+  // Custom headers to prevent Render 502/HTML drops
   const url = `${FUTURES_BASE}${path}?${query}&signature=${sig}`;
-  const r = await fetch(url, { method, headers: { "X-MBX-APIKEY": creds.apiKey } });
+  
+  let r = await fetch(url, { 
+    method, 
+    headers: { 
+      "X-MBX-APIKEY": creds.apiKey,
+      "User-Agent": "Mozilla/5.0",
+      "Accept": "application/json"
+    } 
+  });
+
+  // Retry once if Render proxy was waking up from cold start
+  if (r.status === 502 || r.status === 503 || r.status === 504) {
+    await new Promise(res => setTimeout(res, 2000));
+    r = await fetch(url, { 
+      method, 
+      headers: { 
+        "X-MBX-APIKEY": creds.apiKey,
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json"
+      } 
+    });
+  }
+
   const text = await r.text();
   try {
     const d = JSON.parse(text);
@@ -206,11 +230,12 @@ async function futuresSignedRequest(creds, method, path, params = {}) {
     return d;
   } catch (e) {
     if (text.includes("<!DOCTYPE") || text.includes("<html")) {
-      throw new Error("Proxy server loading/error. Please retry in 10 seconds.");
+      throw new Error("Render Proxy waking up. Tap Connect again in 5 seconds.");
     }
     throw new Error(text.substring(0, 100));
   }
 }
+
 
 async function getCreds(env, userId, exchange) {
   const raw = await env.ACCOUNTS_KV.get(`acct:${userId}:${exchange}`);
