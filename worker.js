@@ -60,32 +60,34 @@ async function hmacHex(secret, message) {
 }
 
 /* ---------------- Multi-Node Binance Request Engine ---------------- */
+/* ---------------- Multi-Node & Proxy Binance Request Engine ---------------- */
 async function futuresSignedRequest(creds, method, path, params = {}) {
   const timestamp = Date.now();
   const query = new URLSearchParams({ ...params, timestamp, recvWindow: 10000 }).toString();
   const sig = await hmacHex(creds.apiSecret, query);
 
-  const endpoints = [
-    `https://fapi.binance.com${path}?${query}&signature=${sig}`,
-    `https://fapi1.binance.com${path}?${query}&signature=${sig}`,
-    `https://fapi2.binance.com${path}?${query}&signature=${sig}`,
-    `https://fapi3.binance.com${path}?${query}&signature=${sig}`
+  const targetPath = `${path}?${query}&signature=${sig}`;
+  
+  const requestConfigs = [
+    { url: `https://fapi.binance.com${targetPath}`, useProxy: false },
+    { url: `https://fapi1.binance.com${targetPath}`, useProxy: false },
+    { url: `https://api.allorigins.win/raw?url=${encodeURIComponent(`https://fapi.binance.com${targetPath}`)}`, useProxy: true }
   ];
 
   let lastErrorMsg = "Unknown Error";
 
-  for (const targetUrl of endpoints) {
+  for (const config of requestConfigs) {
     try {
-      const res = await fetch(targetUrl, {
-        method: method,
-        headers: {
-          "X-MBX-APIKEY": creds.apiKey,
-          "Accept": "application/json",
-          "Content-Type": "application/x-www-form-urlencoded",
-          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
-        }
-      });
+      const headers = {
+        "X-MBX-APIKEY": creds.apiKey,
+        "Accept": "application/json",
+      };
 
+      if (!config.useProxy) {
+        headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36";
+      }
+
+      const res = await fetch(config.url, { method: method, headers: headers });
       const text = await res.text();
 
       if (!text.trim().startsWith("<") && !text.includes("<!DOCTYPE") && !text.includes("<html")) {
@@ -95,7 +97,7 @@ async function futuresSignedRequest(creds, method, path, params = {}) {
         }
         return data;
       } else {
-        lastErrorMsg = "Binance WAF blocked request. Ensure API Key IP restriction is set to Unrestricted.";
+        lastErrorMsg = "Binance WAF blocked request. IP restriction conflict.";
       }
     } catch (e) {
       lastErrorMsg = e.message;
