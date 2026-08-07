@@ -14,7 +14,7 @@ function corsHeaders(origin) {
   return {
     "Access-Control-Allow-Origin": allow,
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, X-MBX-APIKEY",
+    "Access-Control-Allow-Headers": "Content-Type, X-MBX-APIKEY, Authorization",
   };
 }
 
@@ -60,7 +60,6 @@ async function hmacHex(secret, message) {
 }
 
 /* ---------------- Multi-Node Binance Request Engine ---------------- */
-/* ---------------- Multi-Node & Proxy Binance Request Engine ---------------- */
 async function futuresSignedRequest(creds, method, path, params = {}) {
   const timestamp = Date.now();
   const query = new URLSearchParams({ ...params, timestamp, recvWindow: 10000 }).toString();
@@ -68,26 +67,25 @@ async function futuresSignedRequest(creds, method, path, params = {}) {
 
   const targetPath = `${path}?${query}&signature=${sig}`;
   
-  const requestConfigs = [
-    { url: `https://fapi.binance.com${targetPath}`, useProxy: false },
-    { url: `https://fapi1.binance.com${targetPath}`, useProxy: false },
-    { url: `https://api.allorigins.win/raw?url=${encodeURIComponent(`https://fapi.binance.com${targetPath}`)}`, useProxy: true }
+  // Binance official multi-cluster endpoints
+  const endpoints = [
+    `https://fapi.binance.com${targetPath}`,
+    `https://fapi1.binance.com${targetPath}`,
+    `https://fapi2.binance.com${targetPath}`,
+    `https://fapi3.binance.com${targetPath}`
   ];
 
   let lastErrorMsg = "Unknown Error";
 
-  for (const config of requestConfigs) {
+  for (const endpointUrl of endpoints) {
     try {
       const headers = {
         "X-MBX-APIKEY": creds.apiKey,
         "Accept": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
       };
 
-      if (!config.useProxy) {
-        headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36";
-      }
-
-      const res = await fetch(config.url, { method: method, headers: headers });
+      const res = await fetch(endpointUrl, { method: method, headers: headers });
       const text = await res.text();
 
       if (!text.trim().startsWith("<") && !text.includes("<!DOCTYPE") && !text.includes("<html")) {
@@ -97,7 +95,7 @@ async function futuresSignedRequest(creds, method, path, params = {}) {
         }
         return data;
       } else {
-        lastErrorMsg = "Binance WAF blocked request. IP restriction conflict.";
+        lastErrorMsg = "Binance WAF blocked request. Please create a clean API key with Futures enabled.";
       }
     } catch (e) {
       lastErrorMsg = e.message;
@@ -150,7 +148,7 @@ async function handleConnect(request, env, headers) {
   if (!userId || !exchange || !apiKey || !apiSecret) {
     return new Response(JSON.stringify({ error: "Missing required fields" }), { status: 400, headers: { ...headers, "Content-Type": "application/json" } });
   }
-  const record = { apiKey, apiSecret, passphrase: passphrase || null, connectedAt: Date.now() };
+  const record = { apiKey: apiKey.trim(), apiSecret: apiSecret.trim(), passphrase: passphrase || null, connectedAt: Date.now() };
 
   try {
     if (exchange === "binance") {
