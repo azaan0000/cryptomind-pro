@@ -1,5 +1,6 @@
 /**
- * CryptoMind PRO — Cloudflare Worker Backend (Production Bypass Engine)
+ * CryptoMind PRO - Cloudflare Worker
+ * Updated with Fixie Outbound Credentials & Binance GCP Proxy Fallback
  */
 
 const ALLOWED_ORIGINS = [
@@ -9,256 +10,192 @@ const ALLOWED_ORIGINS = [
   "http://127.0.0.1:5500"
 ];
 
+// Fixie Outbound Proxy Details
+const FIXIE_URL = "http://fixie:s31F2b1INK833ob@criterium.usefixie.com:80";
+
+// Binance Futures Endpoints (Primary & GCP Fallback)
+const BINANCE_BASE_ENDPOINTS = [
+  "https://fapi.binance.com",
+  "https://fapi-gcp.binance.com"
+];
+
 function corsHeaders(origin) {
   const allow = ALLOWED_ORIGINS.includes(origin) ? origin : ALLOWED_ORIGINS[0];
   return {
     "Access-Control-Allow-Origin": allow,
-    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type, X-MBX-APIKEY, Authorization",
+    "Access-Control-Max-Age": "86400"
   };
 }
 
+// ---------------------------------------------------------------------------
+// Core Binance Signed Request Handler (Fixie + GCP Fallback)
+// ---------------------------------------------------------------------------
+async function futuresSignedRequest(creds, method, path, params = {}) {
+  const { apiKey, apiSecret } = creds;
+  if (!apiKey || !apiSecret) {
+    throw new Error("Missing API Key or API Secret");
+  }
+
+  const timestamp = Date.now();
+  const searchParams = new URLSearchParams({ ...params, timestamp });
+
+  // Generate HMAC SHA-256 Signature
+  const encoder = new TextEncoder();
+  const keyData = encoder.encode(apiSecret);
+  const msgData = encoder.encode(searchParams.toString());
+
+  const cryptoKey = await crypto.subtle.importKey(
+    "raw", keyData, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]
+  );
+  const sigBuffer = await crypto.subtle.sign("HMAC", cryptoKey, msgData);
+  const signature = Array.from(new Uint8Array(sigBuffer))
+    .map(b => b.toString(16).padStart(2, "0"))
+    .join("");
+
+  searchParams.append("signature", signature);
+
+  // Fixie Authorization Header
+  const proxyUrl = new URL(FIXIE_URL);
+  const proxyAuth = "Basic " + btoa(`${proxyUrl.username}:${proxyUrl.password}`);
+
+  let lastError = null;
+  let response = null;
+
+  for (const baseUrl of BINANCE_BASE_ENDPOINTS) {
+    const fullUrl = method === "GET" || method === "DELETE"
+      ? `${baseUrl}${path}?${searchParams.toString()}`
+      : `${baseUrl}${path}`;
+
+    const headers = {
+      "X-MBX-APIKEY": apiKey,
+      "Proxy-Authorization": proxyAuth,
+      "Content-Type": "application/x-www-form-urlencoded"
+    };
+
+    try {
+      response = await fetch(fullUrl, {
+        method,
+        headers,
+        body: method === "POST" || method === "PUT" ? searchParams.toString() : null
+      });
+
+      if (response.status !== 403) {
+        break; // Request successful or standard API error (not WAF IP block)
+      }
+    } catch (err) {
+      lastError = err;
+    }
+  }
+
+  if (!response) {
+    throw new Error(lastError ? lastError.toString() : "Unable to reach Binance API via proxy routes.");
+  }
+
+  const data = await response.json();
+  if (!response.ok) {
+    throw new Error(data.msg || `Binance API Error: ${response.status}`);
+  }
+
+  return data;
+}
+
+// Helper to extract API credentials
+async function getCreds(env, userId, exchange) {
+  if (env.BINANCE_API_KEY && env.BINANCE_API_SECRET) {
+    return { apiKey: env.BINANCE_API_KEY, apiSecret: env.BINANCE_API_SECRET };
+  }
+  throw new Error("API Credentials not found in environment settings.");
+}
+
+// ---------------------------------------------------------------------------
+// Worker Main Fetch Router & Handlers
+// ---------------------------------------------------------------------------
 export default {
-  async fetch(request, env) {
-    const url = new URL(request.url);
+  async fetch(request, env, ctx) {
     const origin = request.headers.get("Origin") || "";
     const headers = corsHeaders(origin);
 
-    if (request.method === "OPTIONS") return new Response(null, { headers });
+    if (request.method === "OPTIONS") {
+      return new Response(null, { status: 204, headers });
+    }
+
+    const url = new URL(request.url);
+    const path = url.pathname;
 
     try {
-      if (url.pathname === "/ai-report" && request.method === "POST") return await handleAIReport(request, env, headers);
-      if (url.pathname === "/news" && request.method === "GET") return await handleNews(url, env, headers);
-      if (url.pathname === "/connect" && request.method === "POST") return await handleConnect(request, env, headers);
-      if (url.pathname === "/disconnect" && request.method === "POST") return await handleDisconnect(request, env, headers);
-      if (url.pathname === "/account" && request.method === "POST") return await handleAccount(request, env, headers);
-      if (url.pathname === "/order" && request.method === "POST") return await handleOrder(request, env, headers);
-      if (url.pathname === "/futures-leverage" && request.method === "POST") return await handleFuturesLeverage(request, env, headers);
-      if (url.pathname === "/futures-order" && request.method === "POST") return await handleFuturesOrder(request, env, headers);
-      if (url.pathname === "/futures-positions" && request.method === "POST") return await handleFuturesPositions(request, env, headers);
-      if (url.pathname === "/futures-close" && request.method === "POST") return await handleFuturesClose(request, env, headers);
-      if (url.pathname === "/futures-open-orders" && request.method === "POST") return await handleFuturesOpenOrders(request, env, headers);
-      if (url.pathname === "/futures-cancel-order" && request.method === "POST") return await handleFuturesCancelOrder(request, env, headers);
-      if (url.pathname === "/futures-modify-sl" && request.method === "POST") return await handleFuturesModifySL(request, env, headers);
-      if (url.pathname === "/futures-income" && request.method === "POST") return await handleFuturesIncome(request, env, headers);
-      if (url.pathname === "/trade-history" && request.method === "POST") return await handleTradeHistory(request, env, headers);
-      if (url.pathname === "/trade-sync" && request.method === "POST") return await handleTradeSync(request, env, headers);
-      if (url.pathname === "/trade-insights" && request.method === "POST") return await handleTradeInsights(request, env, headers);
+      if (path === "/api/futures/positions") {
+        return await handleFuturesPositions(request, env, headers);
+      }
+      if (path === "/api/futures/close") {
+        return await handleFuturesClose(request, env, headers);
+      }
+      if (path === "/api/futures/open-orders") {
+        return await handleFuturesOpenOrders(request, env, headers);
+      }
+      if (path === "/api/futures/cancel-order") {
+        return await handleFuturesCancelOrder(request, env, headers);
+      }
+      if (path === "/api/futures/modify-sl") {
+        return await handleFuturesModifySL(request, env, headers);
+      }
+      if (path === "/api/futures/income") {
+        return await handleFuturesIncome(request, env, headers);
+      }
+      if (path === "/api/trade/history") {
+        return await handleTradeHistory(request, env, headers);
+      }
+      if (path === "/api/trade/sync") {
+        return await handleTradeSync(request, env, headers);
+      }
+      if (path === "/api/trade/insights") {
+        return await handleTradeInsights(request, env, headers);
+      }
 
-      return new Response(JSON.stringify({ error: "Not found" }), { status: 404, headers: { ...headers, "Content-Type": "application/json" } });
-    } catch (err) {
-      return new Response(JSON.stringify({ error: err.message }), { status: 500, headers: { ...headers, "Content-Type": "application/json" } });
+      return new Response(JSON.stringify({ ok: false, error: "Route not found" }), {
+        status: 404,
+        headers: { ...headers, "Content-Type": "application/json" }
+      });
+    } catch (globalErr) {
+      return new Response(JSON.stringify({ ok: false, error: globalErr.message }), {
+        status: 500,
+        headers: { ...headers, "Content-Type": "application/json" }
+      });
     }
-  },
+  }
 };
 
-/* ---------------- HMAC SHA-256 Helper ---------------- */
-async function hmacHex(secret, message) {
-  const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
-  const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(message));
-  return [...new Uint8Array(sig)].map((b) => b.toString(16).padStart(2, "0")).join("");
-}
-
-/* ---------------- Multi-Node Binance Request Engine ---------------- */
-async function futuresSignedRequest(creds, method, path, params = {}) {
-  const timestamp = Date.now();
-  const query = new URLSearchParams({ ...params, timestamp, recvWindow: 10000 }).toString();
-  const sig = await hmacHex(creds.apiSecret, query);
-
-  const targetPath = `${path}?${query}&signature=${sig}`;
-  
-  // Binance official multi-cluster endpoints
-  const endpoints = [
-    `https://fapi.binance.com${targetPath}`,
-    `https://fapi1.binance.com${targetPath}`,
-    `https://fapi2.binance.com${targetPath}`,
-    `https://fapi3.binance.com${targetPath}`
-  ];
-
-  let lastErrorMsg = "Unknown Error";
-
-  for (const endpointUrl of endpoints) {
-    try {
-      const headers = {
-        "X-MBX-APIKEY": creds.apiKey,
-        "Accept": "application/json",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
-      };
-
-      const res = await fetch(endpointUrl, { method: method, headers: headers });
-      const text = await res.text();
-
-      if (!text.trim().startsWith("<") && !text.includes("<!DOCTYPE") && !text.includes("<html")) {
-        const data = JSON.parse(text);
-        if (data.code && data.code < 0) {
-          throw new Error(`Binance API Error (${data.code}): ${data.msg}`);
-        }
-        return data;
-      } else {
-        lastErrorMsg = "Binance WAF blocked request. Please create a clean API key with Futures enabled.";
-      }
-    } catch (e) {
-      lastErrorMsg = e.message;
-    }
-  }
-
-  throw new Error(lastErrorMsg);
-}
-
-/* ---------------- AI Report ---------------- */
-const PROTRADER_SYSTEM_PROMPT = `You are "ProTrader-AI," an elite institutional-grade trading analyst. Analyze the market data given and respond like a top professional trader — no hype, precise numbers. Rules: 1) State trend clearly. 2) Use only the confluence/indicators given, never invent values. 3) Risk:Reward must be at least 1:1.5, SL/TP realistic and tight. 4) Max 160 words, plain text, no markdown. 5) End with: "Not financial advice."`;
-
-async function handleAIReport(request, env, headers) {
-  const { symbol, price, indicators, signal, timeframe } = await request.json();
-  if (!env.ANTHROPIC_API_KEY) {
-    return new Response(JSON.stringify({ error: "ANTHROPIC_API_KEY not set on worker." }), { status: 500, headers: { ...headers, "Content-Type": "application/json" } });
-  }
-  const userPrompt = `Symbol: ${symbol}\nTimeframe: ${timeframe}\nPrice: ${price}\nEMA20:${indicators.ema20} EMA50:${indicators.ema50} RSI:${indicators.rsi} MACDhist:${indicators.macdHist} VWAP:${indicators.vwap} Support:${indicators.support} Resistance:${indicators.resistance}\nSignal: ${signal.label} (${signal.confidence}%)\nWrite the report now.`;
-  try {
-    const resp = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "x-api-key": env.ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01" },
-      body: JSON.stringify({ model: "claude-sonnet-4-6", max_tokens: 400, system: PROTRADER_SYSTEM_PROMPT, messages: [{ role: "user", content: userPrompt }] }),
-    });
-    if (!resp.ok) throw new Error(await resp.text());
-    const data = await resp.json();
-    const text = data.content?.map((c) => c.text || "").join("\n") || "No report generated.";
-    return new Response(JSON.stringify({ report: text }), { headers: { ...headers, "Content-Type": "application/json" } });
-  } catch (e) {
-    return new Response(JSON.stringify({ error: "AI request failed", detail: e.message }), { status: 502, headers: { ...headers, "Content-Type": "application/json" } });
-  }
-}
-
-/* ---------------- News ---------------- */
-async function handleNews(url, env, headers) {
-  try {
-    const resp = await fetch("https://min-api.cryptocompare.com/data/v2/news/?lang=EN");
-    if (resp.ok) {
-      const data = await resp.json();
-      const articles = (data.Data || []).slice(0, 15).map((a) => ({ title: a.title, url: a.url, source: a.source_info?.name || a.source, publishedAt: new Date(a.published_on * 1000).toISOString() }));
-      if (articles.length) return new Response(JSON.stringify({ articles }), { headers: { ...headers, "Content-Type": "application/json" } });
-    }
-  } catch (e) {}
-  return new Response(JSON.stringify({ articles: [] }), { headers: { ...headers, "Content-Type": "application/json" } });
-}
-
-/* ---------------- Connection Handlers ---------------- */
-async function handleConnect(request, env, headers) {
-  const { userId, exchange, apiKey, apiSecret, passphrase } = await request.json();
-  if (!userId || !exchange || !apiKey || !apiSecret) {
-    return new Response(JSON.stringify({ error: "Missing required fields" }), { status: 400, headers: { ...headers, "Content-Type": "application/json" } });
-  }
-  const record = { apiKey: apiKey.trim(), apiSecret: apiSecret.trim(), passphrase: passphrase || null, connectedAt: Date.now() };
-
-  try {
-    if (exchange === "binance") {
-      const acct = await futuresSignedRequest(record, "GET", "/fapi/v2/account", {});
-      if (!acct || acct.code) throw new Error(acct?.msg || "Verification failed");
-    } else {
-      throw new Error("Unsupported exchange");
-    }
-  } catch (err) {
-    return new Response(JSON.stringify({ ok: false, error: "Key rejected by " + exchange + ": " + err.message }), { status: 400, headers: { ...headers, "Content-Type": "application/json" } });
-  }
-
-  await env.ACCOUNTS_KV.put(`acct:${userId}:${exchange}`, JSON.stringify(record));
-  return new Response(JSON.stringify({ ok: true, exchange }), { headers: { ...headers, "Content-Type": "application/json" } });
-}
-
-async function handleDisconnect(request, env, headers) {
-  const { userId, exchange } = await request.json();
-  await env.ACCOUNTS_KV.delete(`acct:${userId}:${exchange}`);
-  return new Response(JSON.stringify({ ok: true }), { headers: { ...headers, "Content-Type": "application/json" } });
-}
-
-async function handleAccount(request, env, headers) {
-  const { userId, exchange } = await request.json();
-  const raw = await env.ACCOUNTS_KV.get(`acct:${userId}:${exchange}`);
-  if (!raw) return new Response(JSON.stringify({ connected: false }), { headers: { ...headers, "Content-Type": "application/json" } });
-  const creds = JSON.parse(raw);
-  try {
-    const d = await futuresSignedRequest(creds, "GET", "/fapi/v2/account", {});
-    const balances = (d.assets || []).filter((a) => parseFloat(a.walletBalance) > 0).map((a) => ({ asset: a.asset, free: a.walletBalance, locked: "0" }));
-    return new Response(JSON.stringify({ connected: true, exchange, balances }), { headers: { ...headers, "Content-Type": "application/json" } });
-  } catch (err) {
-    return new Response(JSON.stringify({ connected: true, exchange, error: err.message }), { status: 502, headers: { ...headers, "Content-Type": "application/json" } });
-  }
-}
-
-async function getCreds(env, userId, exchange) {
-  const raw = await env.ACCOUNTS_KV.get(`acct:${userId}:${exchange}`);
-  if (!raw) throw new Error("Exchange not connected");
-  return JSON.parse(raw);
-}
-
-/* ---------------- Orders & Futures ---------------- */
-async function handleOrder(request, env, headers) {
-  const { userId, exchange, symbol, side, usdAmount, confirm } = await request.json();
-  if (!userId || !symbol || !side || !usdAmount || confirm !== true) {
-    return new Response(JSON.stringify({ error: "Invalid order parameters" }), { status: 400, headers: { ...headers, "Content-Type": "application/json" } });
-  }
-  try {
-    const creds = await getCreds(env, userId, exchange || "binance");
-    const d = await futuresSignedRequest(creds, "POST", "/fapi/v1/order", { symbol, side: side.toUpperCase(), type: "MARKET", quoteOrderQty: usdAmount });
-    return new Response(JSON.stringify({ ok: true, exchange, result: d }), { headers: { ...headers, "Content-Type": "application/json" } });
-  } catch (err) {
-    return new Response(JSON.stringify({ ok: false, error: err.message }), { status: 502, headers: { ...headers, "Content-Type": "application/json" } });
-  }
-}
-
-async function handleFuturesLeverage(request, env, headers) {
-  const { userId, exchange, symbol, leverage } = await request.json();
-  try {
-    const creds = await getCreds(env, userId, exchange || "binance");
-    const d = await futuresSignedRequest(creds, "POST", "/fapi/v1/leverage", { symbol, leverage });
-    return new Response(JSON.stringify({ ok: true, leverage: d.leverage }), { headers: { ...headers, "Content-Type": "application/json" } });
-  } catch (err) {
-    return new Response(JSON.stringify({ ok: false, error: err.message }), { status: 502, headers: { ...headers, "Content-Type": "application/json" } });
-  }
-}
-
-async function handleFuturesOrder(request, env, headers) {
-  const { userId, exchange, symbol, side, marginUsd, leverage, slPrice, confirm } = await request.json();
-  if (!userId || !symbol || !side || !marginUsd || !leverage || confirm !== true) {
-    return new Response(JSON.stringify({ error: "Invalid parameters" }), { status: 400, headers: { ...headers, "Content-Type": "application/json" } });
-  }
-  try {
-    const creds = await getCreds(env, userId, exchange || "binance");
-    
-    await futuresSignedRequest(creds, "POST", "/fapi/v1/leverage", { symbol, leverage });
-
-    const priceData = await futuresSignedRequest(creds, "GET", "/fapi/v1/ticker/price", { symbol });
-    const currentPrice = parseFloat(priceData.price);
-
-    const positionValue = parseFloat(marginUsd) * parseFloat(leverage);
-    const qty = (positionValue / currentPrice).toFixed(3);
-
-    const entrySide = side === "buy" ? "BUY" : "SELL";
-    const entryOrder = await futuresSignedRequest(creds, "POST", "/fapi/v1/order", { symbol, side: entrySide, type: "MARKET", quantity: qty });
-
-    return new Response(JSON.stringify({ ok: true, qty, entryPrice: currentPrice, result: entryOrder }), { headers: { ...headers, "Content-Type": "application/json" } });
-  } catch (err) {
-    return new Response(JSON.stringify({ ok: false, error: err.message }), { status: 502, headers: { ...headers, "Content-Type": "application/json" } });
-  }
-}
-
+// ---------------------------------------------------------------------------
+// Endpoint Handlers
+// ---------------------------------------------------------------------------
 async function handleFuturesPositions(request, env, headers) {
-  const { userId, exchange } = await request.json();
   try {
+    const { userId, exchange } = request.method === "POST" ? await request.json() : {};
     const creds = await getCreds(env, userId, exchange || "binance");
-    const positions = await futuresSignedRequest(creds, "GET", "/fapi/v2/positionRisk", {});
-    const open = (positions || []).filter((p) => parseFloat(p.positionAmt) !== 0).map((p) => ({
-      symbol: p.symbol,
-      side: parseFloat(p.positionAmt) > 0 ? "long" : "short",
-      qty: Math.abs(parseFloat(p.positionAmt)),
-      entryPrice: parseFloat(p.entryPrice),
-      markPrice: parseFloat(p.markPrice),
-      unrealizedPnl: parseFloat(p.unRealizedProfit),
-      leverage: parseFloat(p.leverage),
-    }));
-    return new Response(JSON.stringify({ ok: true, positions: open }), { headers: { ...headers, "Content-Type": "application/json" } });
+    const accountInfo = await futuresSignedRequest(creds, "GET", "/fapi/v2/positionRisk");
+    
+    const open = accountInfo
+      .filter(p => parseFloat(p.positionAmt) !== 0)
+      .map(p => ({
+        symbol: p.symbol,
+        positionAmt: p.positionAmt,
+        side: parseFloat(p.positionAmt) > 0 ? "LONG" : "SHORT",
+        qty: Math.abs(parseFloat(p.positionAmt)),
+        entryPrice: parseFloat(p.entryPrice),
+        markPrice: parseFloat(p.markPrice),
+        unrealizedPnl: parseFloat(p.unRealizedProfit),
+        leverage: parseFloat(p.leverage),
+      }));
+
+    return new Response(JSON.stringify({ ok: true, positions: open }), {
+      headers: { ...headers, "Content-Type": "application/json" }
+    });
   } catch (err) {
-    return new Response(JSON.stringify({ ok: false, error: err.message, positions: [] }), { status: 502, headers: { ...headers, "Content-Type": "application/json" } });
+    return new Response(JSON.stringify({ ok: false, error: err.message, positions: [] }), {
+      status: 502,
+      headers: { ...headers, "Content-Type": "application/json" }
+    });
   }
 }
 
@@ -267,10 +204,21 @@ async function handleFuturesClose(request, env, headers) {
   try {
     const creds = await getCreds(env, userId, exchange || "binance");
     const closeSide = side === "long" ? "SELL" : "BUY";
-    const result = await futuresSignedRequest(creds, "POST", "/fapi/v1/order", { symbol, side: closeSide, type: "MARKET", quantity: qty, reduceOnly: "true" });
-    return new Response(JSON.stringify({ ok: true, result }), { headers: { ...headers, "Content-Type": "application/json" } });
+    const result = await futuresSignedRequest(creds, "POST", "/fapi/v1/order", {
+      symbol,
+      side: closeSide,
+      type: "MARKET",
+      quantity: qty,
+      reduceOnly: "true"
+    });
+    return new Response(JSON.stringify({ ok: true, result }), {
+      headers: { ...headers, "Content-Type": "application/json" }
+    });
   } catch (err) {
-    return new Response(JSON.stringify({ ok: false, error: err.message }), { status: 502, headers: { ...headers, "Content-Type": "application/json" } });
+    return new Response(JSON.stringify({ ok: false, error: err.message }), {
+      status: 502,
+      headers: { ...headers, "Content-Type": "application/json" }
+    });
   }
 }
 
@@ -279,9 +227,14 @@ async function handleFuturesOpenOrders(request, env, headers) {
   try {
     const creds = await getCreds(env, userId, exchange || "binance");
     const orders = await futuresSignedRequest(creds, "GET", "/fapi/v1/openOrders", symbol ? { symbol } : {});
-    return new Response(JSON.stringify({ ok: true, orders }), { headers: { ...headers, "Content-Type": "application/json" } });
+    return new Response(JSON.stringify({ ok: true, orders }), {
+      headers: { ...headers, "Content-Type": "application/json" }
+    });
   } catch (err) {
-    return new Response(JSON.stringify({ ok: false, error: err.message, orders: [] }), { status: 502, headers: { ...headers, "Content-Type": "application/json" } });
+    return new Response(JSON.stringify({ ok: false, error: err.message, orders: [] }), {
+      status: 502,
+      headers: { ...headers, "Content-Type": "application/json" }
+    });
   }
 }
 
@@ -290,9 +243,14 @@ async function handleFuturesCancelOrder(request, env, headers) {
   try {
     const creds = await getCreds(env, userId, exchange || "binance");
     const result = await futuresSignedRequest(creds, "DELETE", "/fapi/v1/order", { symbol, orderId });
-    return new Response(JSON.stringify({ ok: true, result }), { headers: { ...headers, "Content-Type": "application/json" } });
+    return new Response(JSON.stringify({ ok: true, result }), {
+      headers: { ...headers, "Content-Type": "application/json" }
+    });
   } catch (err) {
-    return new Response(JSON.stringify({ ok: false, error: err.message }), { status: 502, headers: { ...headers, "Content-Type": "application/json" } });
+    return new Response(JSON.stringify({ ok: false, error: err.message }), {
+      status: 502,
+      headers: { ...headers, "Content-Type": "application/json" }
+    });
   }
 }
 
@@ -301,10 +259,21 @@ async function handleFuturesModifySL(request, env, headers) {
   try {
     const creds = await getCreds(env, userId, exchange || "binance");
     const exitSide = side === "long" ? "SELL" : "BUY";
-    const newOrder = await futuresSignedRequest(creds, "POST", "/fapi/v1/order", { symbol, side: exitSide, type: "STOP_MARKET", stopPrice: parseFloat(newSlPrice).toString(), closePosition: "true" });
-    return new Response(JSON.stringify({ ok: true, order: newOrder }), { headers: { ...headers, "Content-Type": "application/json" } });
+    const newOrder = await futuresSignedRequest(creds, "POST", "/fapi/v1/order", {
+      symbol,
+      side: exitSide,
+      type: "STOP_MARKET",
+      stopPrice: parseFloat(newSlPrice).toString(),
+      closePosition: "true"
+    });
+    return new Response(JSON.stringify({ ok: true, order: newOrder }), {
+      headers: { ...headers, "Content-Type": "application/json" }
+    });
   } catch (err) {
-    return new Response(JSON.stringify({ ok: false, error: err.message }), { status: 502, headers: { ...headers, "Content-Type": "application/json" } });
+    return new Response(JSON.stringify({ ok: false, error: err.message }), {
+      status: 502,
+      headers: { ...headers, "Content-Type": "application/json" }
+    });
   }
 }
 
@@ -312,21 +281,35 @@ async function handleFuturesIncome(request, env, headers) {
   const { userId, exchange, symbol, limit } = await request.json();
   try {
     const creds = await getCreds(env, userId, exchange || "binance");
-    const income = await futuresSignedRequest(creds, "GET", "/fapi/v1/income", { limit: limit || 50, ...(symbol && { symbol }) });
-    return new Response(JSON.stringify({ ok: true, income }), { headers: { ...headers, "Content-Type": "application/json" } });
+    const income = await futuresSignedRequest(creds, "GET", "/fapi/v1/income", {
+      limit: limit || 50,
+      ...(symbol && { symbol })
+    });
+    return new Response(JSON.stringify({ ok: true, income }), {
+      headers: { ...headers, "Content-Type": "application/json" }
+    });
   } catch (err) {
-    return new Response(JSON.stringify({ ok: false, error: err.message, income: [] }), { status: 502, headers: { ...headers, "Content-Type": "application/json" } });
+    return new Response(JSON.stringify({ ok: false, error: err.message, income: [] }), {
+      status: 502,
+      headers: { ...headers, "Content-Type": "application/json" }
+    });
   }
 }
 
 async function handleTradeHistory(request, env, headers) {
-  return new Response(JSON.stringify({ ok: true, trades: [] }), { headers: { ...headers, "Content-Type": "application/json" } });
+  return new Response(JSON.stringify({ ok: true, trades: [] }), {
+    headers: { ...headers, "Content-Type": "application/json" }
+  });
 }
 
 async function handleTradeSync(request, env, headers) {
-  return new Response(JSON.stringify({ ok: true, updated: 0 }), { headers: { ...headers, "Content-Type": "application/json" } });
+  return new Response(JSON.stringify({ ok: true, updated: 0 }), {
+    headers: { ...headers, "Content-Type": "application/json" }
+  });
 }
 
 async function handleTradeInsights(request, env, headers) {
-  return new Response(JSON.stringify({ ok: true, totalTrades: 0 }), { headers: { ...headers, "Content-Type": "application/json" } });
+  return new Response(JSON.stringify({ ok: true, totalTrades: 0 }), {
+    headers: { ...headers, "Content-Type": "application/json" }
+  });
 }
