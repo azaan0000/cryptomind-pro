@@ -1,12 +1,13 @@
 /**
- * CryptoMind PRO – Full Production Cloudflare Worker
- * Preserves All Application Routes, API Key Parsing, HMAC Signing,
- * Fixie Outbound Proxy Routing, and Binance GCP Fallback.
+ * CryptoMind PRO – Comprehensive Enterprise Cloudflare Worker Backend
+ * Fully preserves all routing paths, proxy mechanics, signing helpers, 
+ * error isolation, and ensures guaranteed JSON responses to the frontend.
  */
 
-// ---------------------------------------------------------------------------
-// 1. Security & Configuration
-// ---------------------------------------------------------------------------
+// ============================================================================
+// 1. CONFIGURATION & ENVIRONMENT SETUP
+// ============================================================================
+
 const ALLOWED_ORIGINS = [
   "https://cryptomind-pro.pages.dev",
   "https://azaan0000.github.io",
@@ -21,340 +22,376 @@ const BINANCE_BASE_ENDPOINTS = [
   "https://fapi-gcp.binance.com"
 ];
 
-// ---------------------------------------------------------------------------
-// 2. Utility Functions
-// ---------------------------------------------------------------------------
-function corsHeaders(origin) {
-  const allow = ALLOWED_ORIGINS.includes(origin) ? origin : ALLOWED_ORIGINS[0];
+// ============================================================================
+// 2. CORS & HEADERS BUILDER
+// ============================================================================
+
+function buildCorsHeaders(requestOrigin) {
+  const allowOrigin = ALLOWED_ORIGINS.includes(requestOrigin) ? requestOrigin : ALLOWED_ORIGINS[0];
   return {
-    "Access-Control-Allow-Origin": allow,
+    "Access-Control-Allow-Origin": allowOrigin,
     "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, X-MBX-APIKEY, Authorization, x-api-key, x-api-secret",
-    "Access-Control-Max-Age": "86400"
+    "Access-Control-Allow-Headers": "Content-Type, X-MBX-APIKEY, Authorization, x-api-key, x-api-secret, X-MBX-SECRET",
+    "Access-Control-Max-Age": "86400",
+    "Content-Type": "application/json; charset=utf-8"
   };
 }
 
-async function generateHmacSha256(queryString, apiSecret) {
+function jsonResponse(data, status = 200, headers = {}) {
+  return new Response(JSON.stringify(data), {
+    status: status,
+    headers: {
+      "Content-Type": "application/json; charset=utf-8",
+      ...headers
+    }
+  });
+}
+
+// ============================================================================
+// 3. CRYPTOGRAPHIC SIGNING & PARSING UTILITIES
+// ============================================================================
+
+async function calculateHmacSha256(queryString, apiSecret) {
   const encoder = new TextEncoder();
   const keyData = encoder.encode(apiSecret);
   const msgData = encoder.encode(queryString);
 
   const cryptoKey = await crypto.subtle.importKey(
-    "raw", keyData, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]
+    "raw",
+    keyData,
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
   );
-  const sigBuffer = await crypto.subtle.sign("HMAC", cryptoKey, msgData);
-  return Array.from(new Uint8Array(sigBuffer))
+
+  const signatureBuffer = await crypto.subtle.sign("HMAC", cryptoKey, msgData);
+  return Array.from(new Uint8Array(signatureBuffer))
     .map(b => b.toString(16).padStart(2, "0"))
     .join("");
 }
 
-// ---------------------------------------------------------------------------
-// 3. Robust Outbound Request Dispatcher (Fixie + GCP Fallback)
-// ---------------------------------------------------------------------------
-async function dispatchToBinance(pathAndQuery, method, headers = {}, bodyData = null) {
+async function parseRequestBody(request) {
+  if (["GET", "HEAD", "OPTIONS"].includes(request.method)) {
+    return {};
+  }
+  try {
+    const rawText = await request.clone().text();
+    if (!rawText || rawText.trim().length === 0) {
+      return {};
+    }
+    return JSON.parse(rawText);
+  } catch (err) {
+    return {};
+  }
+}
+
+async function extractApiCredentials(request, env, bodyObj = {}) {
+  let apiKey = 
+    request.headers.get("X-MBX-APIKEY") || 
+    request.headers.get("x-api-key") || 
+    bodyObj.apiKey || 
+    bodyObj.key || 
+    (env ? env.BINANCE_API_KEY : "") || "";
+
+  let apiSecret = 
+    request.headers.get("X-MBX-SECRET") || 
+    request.headers.get("x-api-secret") || 
+    bodyObj.apiSecret || 
+    bodyObj.secret || 
+    (env ? env.BINANCE_API_SECRET : "") || "";
+
+  return { apiKey: apiKey.trim(), apiSecret: apiSecret.trim() };
+}
+
+// ============================================================================
+// 4. FIXIE PROXY & BINANCE NETWORK DISPATCHER
+// ============================================================================
+
+async function executeBinanceFetch(pathAndQuery, method, headers = {}, bodyData = null) {
   const proxyUrl = new URL(FIXIE_URL);
-  const proxyAuth = "Basic " + btoa(`${proxyUrl.username}:${proxyUrl.password}`);
+  const proxyAuthToken = "Basic " + btoa(`${proxyUrl.username}:${proxyUrl.password}`);
 
-  let lastError = null;
-  let lastResponse = null;
+  const outgoingHeaders = new Headers(headers);
+  outgoingHeaders.set("Proxy-Authorization", proxyAuthToken);
 
-  const reqHeaders = new Headers(headers);
-  reqHeaders.set("Proxy-Authorization", proxyAuth);
-  
-  // Strip Cloudflare internal headers
-  reqHeaders.delete("cf-connecting-ip");
-  reqHeaders.delete("cf-visitor");
-  reqHeaders.delete("cf-ray");
-  reqHeaders.delete("cf-ipcountry");
+  // Strip Cloudflare internal tracking headers to avoid proxy drops
+  outgoingHeaders.delete("cf-connecting-ip");
+  outgoingHeaders.delete("cf-visitor");
+  outgoingHeaders.delete("cf-ray");
+  outgoingHeaders.delete("cf-ipcountry");
 
-  for (const baseUrl of BINANCE_BASE_ENDPOINTS) {
-    const targetUrl = `${baseUrl}${pathAndQuery}`;
+  let executionErrors = [];
+
+  // Strategy 1: Attempt through Fixie Outbound Tunneling
+  for (const endpoint of BINANCE_BASE_ENDPOINTS) {
+    const fullTargetUrl = `${endpoint}${pathAndQuery}`;
     try {
-      const response = await fetch(targetUrl, {
+      const response = await fetch(fullTargetUrl, {
         method: method,
-        headers: reqHeaders,
+        headers: outgoingHeaders,
         body: bodyData
       });
 
       if (response.status !== 403) {
         return response;
       }
-      lastResponse = response;
+      executionErrors.push(`Endpoint ${endpoint} returned WAF 403 via Fixie Proxy.`);
     } catch (err) {
-      lastError = err;
+      executionErrors.push(`Network error connecting to ${endpoint} via Fixie: ${err.message}`);
     }
   }
 
-  return lastResponse || new Response(
-    JSON.stringify({ ok: false, error: "Binance API cluster unreachable across proxies.", details: lastError ? lastError.toString() : "Proxy connection failed" }),
-    { status: 502, headers: { "Content-Type": "application/json" } }
-  );
+  // Strategy 2: Fallback Direct Fetch (In case Fixie HTTP tunnel fails)
+  const cleanHeaders = new Headers(headers);
+  cleanHeaders.delete("Proxy-Authorization");
+
+  for (const endpoint of BINANCE_BASE_ENDPOINTS) {
+    const fullTargetUrl = `${endpoint}${pathAndQuery}`;
+    try {
+      const response = await fetch(fullTargetUrl, {
+        method: method,
+        headers: cleanHeaders,
+        body: bodyData
+      });
+
+      if (response.status !== 403) {
+        return response;
+      }
+      executionErrors.push(`Endpoint ${endpoint} returned WAF 403 via Direct Route.`);
+    } catch (err) {
+      executionErrors.push(`Network error connecting to ${endpoint} via Direct Route: ${err.message}`);
+    }
+  }
+
+  throw new Error(`All Binance Connection Paths Exhausted: ${executionErrors.join(" | ")}`);
 }
 
-async function futuresSignedRequest(creds, method, path, params = {}) {
-  const { apiKey, apiSecret } = creds;
+async function sendBinanceSignedRequest(credentials, method, path, params = {}) {
+  const { apiKey, apiSecret } = credentials;
+
   if (!apiKey || !apiSecret) {
-    throw new Error("Missing API Key or API Secret");
+    throw new Error("Missing Binance API Key or API Secret. Please check your exchange setup.");
   }
 
   const timestamp = Date.now();
   const searchParams = new URLSearchParams();
-  
-  for (const [key, value] of Object.entries(params)) {
-    if (value !== undefined && value !== null) {
-      searchParams.append(key, value.toString());
+
+  for (const [paramKey, paramVal] of Object.entries(params)) {
+    if (paramVal !== undefined && paramVal !== null) {
+      searchParams.append(paramKey, paramVal.toString());
     }
   }
   searchParams.append("timestamp", timestamp.toString());
 
-  const signature = await generateHmacSha256(searchParams.toString(), apiSecret);
+  const signature = await calculateHmacSha256(searchParams.toString(), apiSecret);
   searchParams.append("signature", signature);
 
-  const headers = {
+  const requestHeaders = {
     "X-MBX-APIKEY": apiKey,
     "Content-Type": "application/x-www-form-urlencoded"
   };
 
-  const pathAndQuery = (method === "GET" || method === "DELETE")
+  const targetPathAndQuery = (method === "GET" || method === "DELETE")
     ? `${path}?${searchParams.toString()}`
     : path;
 
-  const bodyData = (method === "POST" || method === "PUT")
+  const requestBody = (method === "POST" || method === "PUT")
     ? searchParams.toString()
     : null;
 
-  const response = await dispatchToBinance(pathAndQuery, method, headers, bodyData);
-  const data = await response.json();
+  const binanceRawResponse = await executeBinanceFetch(targetPathAndQuery, method, requestHeaders, requestBody);
+  const responseText = await binanceRawResponse.text();
 
-  if (!response.ok) {
-    throw new Error(data.msg || `Binance API Error: ${response.status}`);
+  let parsedJson = null;
+  try {
+    parsedJson = JSON.parse(responseText);
+  } catch (parseError) {
+    throw new Error(`Invalid non-JSON response from exchange: ${responseText.substring(0, 150)}`);
   }
 
-  return data;
-}
-
-// Credential Extractor (Supports Request Body, Headers, or Env)
-async function extractCreds(request, env, bodyObj = null) {
-  let apiKey = request.headers.get("X-MBX-APIKEY") || request.headers.get("x-api-key");
-  let apiSecret = request.headers.get("X-MBX-SECRET") || request.headers.get("x-api-secret");
-
-  if (bodyObj) {
-    if (!apiKey && bodyObj.apiKey) apiKey = bodyObj.apiKey;
-    if (!apiSecret && bodyObj.apiSecret) apiSecret = bodyObj.apiSecret;
+  if (!binanceRawResponse.ok) {
+    const binanceErrorMessage = parsedJson.msg || `Exchange API returned HTTP Error ${binanceRawResponse.status}`;
+    throw new Error(binanceErrorMessage);
   }
 
-  if (!apiKey && env.BINANCE_API_KEY) apiKey = env.BINANCE_API_KEY;
-  if (!apiSecret && env.BINANCE_API_SECRET) apiSecret = env.BINANCE_API_SECRET;
-
-  return { apiKey, apiSecret };
+  return parsedJson;
 }
 
-// ---------------------------------------------------------------------------
-// 4. Main Event Fetch Router
-// ---------------------------------------------------------------------------
+// ============================================================================
+// 5. MAIN ROUTER & CONTROLLER LAYER
+// ============================================================================
+
 export default {
   async fetch(request, env, ctx) {
-    const origin = request.headers.get("Origin") || "";
-    const headers = corsHeaders(origin);
+    const originHeader = request.headers.get("Origin") || "";
+    const cors = buildCorsHeaders(originHeader);
 
+    // Preflight Handling
     if (request.method === "OPTIONS") {
-      return new Response(null, { status: 204, headers });
+      return new Response(null, { status: 204, headers: cors });
     }
 
-    const url = new URL(request.url);
-    const path = url.pathname;
+    const requestUrl = new URL(request.url);
+    const pathname = requestUrl.pathname;
 
     try {
-      let bodyData = null;
-      if (["POST", "PUT", "DELETE"].includes(request.method)) {
-        try {
-          bodyData = await request.clone().json();
-        } catch (e) {
-          bodyData = {};
-        }
+      const bodyParams = await parseRequestBody(request);
+      const credentials = await extractApiCredentials(request, env, bodyParams);
+
+      // Route 1: Health & Connectivity Checks
+      if (pathname === "/" || pathname === "/api" || pathname === "/api/health" || pathname === "/api/connect" || pathname === "/api/status") {
+        return jsonResponse({
+          ok: true,
+          status: "online",
+          service: "CryptoMind PRO Gateway",
+          timestamp: new Date().toISOString()
+        }, 200, cors);
       }
 
-      // Route 1: Connect / Health / Status Check
-      if (path === "/api/connect" || path === "/api/health" || path === "/api/status") {
-        return new Response(JSON.stringify({ ok: true, message: "CryptoMind PRO Worker Connected" }), {
-          headers: { ...headers, "Content-Type": "application/json" }
-        });
+      // Route 2: Server Time Synchronization
+      if (pathname === "/api/time" || pathname === "/v1/time") {
+        const binanceTimeRes = await executeBinanceFetch("/fapi/v1/time", "GET");
+        const timeData = await binanceTimeRes.json();
+        return jsonResponse(timeData, binanceTimeRes.status, cors);
       }
 
-      // Route 2: Server Time
-      if (path === "/api/time" || path === "/v1/time") {
-        const binanceRes = await dispatchToBinance("/fapi/v1/time", "GET");
-        const data = await binanceRes.json();
-        return new Response(JSON.stringify(data), {
-          status: binanceRes.status,
-          headers: { ...headers, "Content-Type": "application/json" }
-        });
+      // Route 3: Klines & Candlesticks Chart Data
+      if (pathname === "/api/klines" || pathname === "/v1/klines") {
+        const symbol = requestUrl.searchParams.get("symbol") || "BTCUSDT";
+        const interval = requestUrl.searchParams.get("interval") || "1h";
+        const limit = requestUrl.searchParams.get("limit") || "100";
+        const klinesRes = await executeBinanceFetch(`/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`, "GET");
+        const klinesData = await klinesRes.json();
+        return jsonResponse(klinesData, klinesRes.status, cors);
       }
 
-      // Route 3: Klines / Candlesticks
-      if (path === "/api/klines" || path === "/v1/klines") {
-        const symbol = url.searchParams.get("symbol") || "BTCUSDT";
-        const interval = url.searchParams.get("interval") || "1h";
-        const limit = url.searchParams.get("limit") || "100";
-        const binanceRes = await dispatchToBinance(`/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`, "GET");
-        const data = await binanceRes.json();
-        return new Response(JSON.stringify(data), {
-          status: binanceRes.status,
-          headers: { ...headers, "Content-Type": "application/json" }
-        });
-      }
-
-      // Route 4: Futures Positions
-      if (path === "/api/futures/positions" || path === "/api/positions") {
-        const creds = await extractCreds(request, env, bodyData);
-        const accountInfo = await futuresSignedRequest(creds, "GET", "/fapi/v2/positionRisk");
+      // Route 4: Fetch Active Futures Positions
+      if (pathname === "/api/futures/positions" || pathname === "/api/positions") {
+        const positionRiskData = await sendBinanceSignedRequest(credentials, "GET", "/fapi/v2/positionRisk");
         
-        const open = (Array.isArray(accountInfo) ? accountInfo : [])
-          .filter(p => parseFloat(p.positionAmt) !== 0)
-          .map(p => ({
-            symbol: p.symbol,
-            positionAmt: p.positionAmt,
-            side: parseFloat(p.positionAmt) > 0 ? "LONG" : "SHORT",
-            qty: Math.abs(parseFloat(p.positionAmt)),
-            entryPrice: parseFloat(p.entryPrice),
-            markPrice: parseFloat(p.markPrice),
-            unrealizedPnl: parseFloat(p.unRealizedProfit),
-            leverage: parseFloat(p.leverage),
+        const activePositions = (Array.isArray(positionRiskData) ? positionRiskData : [])
+          .filter(pos => parseFloat(pos.positionAmt) !== 0)
+          .map(pos => ({
+            symbol: pos.symbol,
+            positionAmt: pos.positionAmt,
+            side: parseFloat(pos.positionAmt) > 0 ? "LONG" : "SHORT",
+            qty: Math.abs(parseFloat(pos.positionAmt)),
+            entryPrice: parseFloat(pos.entryPrice),
+            markPrice: parseFloat(pos.markPrice),
+            unrealizedPnl: parseFloat(pos.unRealizedProfit),
+            leverage: parseFloat(pos.leverage)
           }));
 
-        return new Response(JSON.stringify({ ok: true, positions: open }), {
-          headers: { ...headers, "Content-Type": "application/json" }
-        });
+        return jsonResponse({ ok: true, positions: activePositions }, 200, cors);
       }
 
-      // Route 5: Close Futures Position
-      if (path === "/api/futures/close" || path === "/api/close") {
-        const creds = await extractCreds(request, env, bodyData);
-        const { symbol, side, qty } = bodyData || {};
-        const closeSide = side === "long" || side === "LONG" ? "SELL" : "BUY";
-        const result = await futuresSignedRequest(creds, "POST", "/fapi/v1/order", {
-          symbol,
-          side: closeSide,
+      // Route 5: Close Active Position
+      if (pathname === "/api/futures/close" || pathname === "/api/close") {
+        const { symbol, side, qty } = bodyParams;
+        const targetSide = (side || "").toUpperCase() === "LONG" ? "SELL" : "BUY";
+
+        const closeResult = await sendBinanceSignedRequest(credentials, "POST", "/fapi/v1/order", {
+          symbol: symbol,
+          side: targetSide,
           type: "MARKET",
           quantity: qty,
           reduceOnly: "true"
         });
-        return new Response(JSON.stringify({ ok: true, result }), {
-          headers: { ...headers, "Content-Type": "application/json" }
-        });
+
+        return jsonResponse({ ok: true, result: closeResult }, 200, cors);
       }
 
-      // Route 6: Open Orders
-      if (path === "/api/futures/open-orders" || path === "/api/open-orders") {
-        const creds = await extractCreds(request, env, bodyData);
-        const symbol = bodyData?.symbol || url.searchParams.get("symbol");
-        const orders = await futuresSignedRequest(creds, "GET", "/fapi/v1/openOrders", symbol ? { symbol } : {});
-        return new Response(JSON.stringify({ ok: true, orders }), {
-          headers: { ...headers, "Content-Type": "application/json" }
-        });
+      // Route 6: Open Orders List
+      if (pathname === "/api/futures/open-orders" || pathname === "/api/open-orders") {
+        const targetSymbol = bodyParams.symbol || requestUrl.searchParams.get("symbol");
+        const openOrders = await sendBinanceSignedRequest(
+          credentials,
+          "GET",
+          "/fapi/v1/openOrders",
+          targetSymbol ? { symbol: targetSymbol } : {}
+        );
+
+        return jsonResponse({ ok: true, orders: openOrders }, 200, cors);
       }
 
-      // Route 7: Cancel Order
-      if (path === "/api/futures/cancel-order" || path === "/api/cancel-order") {
-        const creds = await extractCreds(request, env, bodyData);
-        const { symbol, orderId } = bodyData || {};
-        const result = await futuresSignedRequest(creds, "DELETE", "/fapi/v1/order", { symbol, orderId });
-        return new Response(JSON.stringify({ ok: true, result }), {
-          headers: { ...headers, "Content-Type": "application/json" }
+      // Route 7: Cancel Specific Order
+      if (pathname === "/api/futures/cancel-order" || pathname === "/api/cancel-order") {
+        const { symbol, orderId } = bodyParams;
+        const cancelResult = await sendBinanceSignedRequest(credentials, "DELETE", "/fapi/v1/order", {
+          symbol: symbol,
+          orderId: orderId
         });
+
+        return jsonResponse({ ok: true, result: cancelResult }, 200, cors);
       }
 
-      // Route 8: Modify Stop Loss
-      if (path === "/api/futures/modify-sl" || path === "/api/modify-sl") {
-        const creds = await extractCreds(request, env, bodyData);
-        const { symbol, side, newSlPrice } = bodyData || {};
-        const exitSide = side === "long" || side === "LONG" ? "SELL" : "BUY";
-        const newOrder = await futuresSignedRequest(creds, "POST", "/fapi/v1/order", {
-          symbol,
+      // Route 8: Modify Stop Loss Order
+      if (pathname === "/api/futures/modify-sl" || pathname === "/api/modify-sl") {
+        const { symbol, side, newSlPrice } = bodyParams;
+        const exitSide = (side || "").toUpperCase() === "LONG" ? "SELL" : "BUY";
+
+        const slOrderResult = await sendBinanceSignedRequest(credentials, "POST", "/fapi/v1/order", {
+          symbol: symbol,
           side: exitSide,
           type: "STOP_MARKET",
           stopPrice: parseFloat(newSlPrice).toString(),
           closePosition: "true"
         });
-        return new Response(JSON.stringify({ ok: true, order: newOrder }), {
-          headers: { ...headers, "Content-Type": "application/json" }
-        });
+
+        return jsonResponse({ ok: true, order: slOrderResult }, 200, cors);
       }
 
-      // Route 9: Account / Balance
-      if (path === "/api/account" || path === "/api/futures/account" || path === "/v2/account") {
-        const creds = await extractCreds(request, env, bodyData);
-        const accountData = await futuresSignedRequest(creds, "GET", "/fapi/v2/account");
-        return new Response(JSON.stringify({ ok: true, account: accountData }), {
-          headers: { ...headers, "Content-Type": "application/json" }
-        });
+      // Route 9: Account Balance & Futures Overview
+      if (pathname === "/api/account" || pathname === "/api/futures/account" || pathname === "/v2/account") {
+        const accountDetails = await sendBinanceSignedRequest(credentials, "GET", "/fapi/v2/account");
+        return jsonResponse({ ok: true, account: accountDetails }, 200, cors);
       }
 
-      // Route 10: Place Order
-      if (path === "/api/order" || path === "/api/futures/order" || path === "/v1/order") {
-        const creds = await extractCreds(request, env, bodyData);
-        const result = await futuresSignedRequest(creds, "POST", "/fapi/v1/order", bodyData || {});
-        return new Response(JSON.stringify({ ok: true, result }), {
-          headers: { ...headers, "Content-Type": "application/json" }
-        });
+      // Route 10: Place New Order (Buy/Sell)
+      if (pathname === "/api/order" || pathname === "/api/futures/order" || pathname === "/v1/order") {
+        const orderResult = await sendBinanceSignedRequest(credentials, "POST", "/fapi/v1/order", bodyParams);
+        return jsonResponse({ ok: true, result: orderResult }, 200, cors);
       }
 
-      // Route 11: Futures Income / Trade Stats
-      if (path === "/api/futures/income" || path === "/api/income") {
-        const creds = await extractCreds(request, env, bodyData);
-        const { symbol, limit } = bodyData || {};
-        const income = await futuresSignedRequest(creds, "GET", "/fapi/v1/income", {
+      // Route 11: Trade History & Income Streams
+      if (pathname === "/api/futures/income" || pathname === "/api/income") {
+        const { symbol, limit } = bodyParams;
+        const incomeLogs = await sendBinanceSignedRequest(credentials, "GET", "/fapi/v1/income", {
           limit: limit || 50,
-          ...(symbol && { symbol })
+          ...(symbol && { symbol: symbol })
         });
-        return new Response(JSON.stringify({ ok: true, income }), {
-          headers: { ...headers, "Content-Type": "application/json" }
-        });
+        return jsonResponse({ ok: true, income: incomeLogs }, 200, cors);
       }
 
-      // Trade Placeholders for Frontend Compatibility
-      if (path === "/api/trade/history") {
-        return new Response(JSON.stringify({ ok: true, trades: [] }), { headers: { ...headers, "Content-Type": "application/json" } });
-      }
-      if (path === "/api/trade/sync") {
-        return new Response(JSON.stringify({ ok: true, updated: 0 }), { headers: { ...headers, "Content-Type": "application/json" } });
-      }
-      if (path === "/api/trade/insights") {
-        return new Response(JSON.stringify({ ok: true, totalTrades: 0 }), { headers: { ...headers, "Content-Type": "application/json" } });
+      // Route 12: Compatibility Placeholders for Frontend Trade History Sync
+      if (pathname === "/api/trade/history" || pathname === "/api/trade/sync" || pathname === "/api/trade/insights") {
+        return jsonResponse({ ok: true, trades: [], updated: 0, totalTrades: 0 }, 200, cors);
       }
 
-      // ---------------------------------------------------------------------
-      // Universal Pass-Through Fallback Route (Catches Any Missing Custom Route)
-      // ---------------------------------------------------------------------
-      const targetPath = path.replace(/^\/api/, "") + url.search;
-      const creds = await extractCreds(request, env, bodyData);
+      // Route 13: Universal Direct Pass-Through Fallback Route
+      const binanceSubPath = pathname.replace(/^\/api/, "") + requestUrl.search;
       const passHeaders = {};
-      if (creds.apiKey) passHeaders["X-MBX-APIKEY"] = creds.apiKey;
+      if (credentials.apiKey) passHeaders["X-MBX-APIKEY"] = credentials.apiKey;
 
-      const binanceRes = await dispatchToBinance(
-        targetPath,
+      const fallbackBinanceRes = await executeBinanceFetch(
+        binanceSubPath,
         request.method,
         passHeaders,
-        ["GET", "HEAD"].includes(request.method) ? null : JSON.stringify(bodyData)
+        ["GET", "HEAD"].includes(request.method) ? null : JSON.stringify(bodyParams)
       );
 
-      const resBody = await binanceRes.arrayBuffer();
-      return new Response(resBody, {
-        status: binanceRes.status,
-        headers: { ...headers, "Content-Type": "application/json" }
+      const responseBuffer = await fallbackBinanceRes.arrayBuffer();
+      return new Response(responseBuffer, {
+        status: fallbackBinanceRes.status,
+        headers: cors
       });
 
-    } catch (globalErr) {
-      return new Response(
-        JSON.stringify({
-          ok: false,
-          error: globalErr.message || globalErr.toString()
-        }),
-        {
-          status: 500,
-          headers: { ...headers, "Content-Type": "application/json" }
-        }
-      );
+    } catch (globalRouterError) {
+      // Global Safety Catch: Converts ALL errors into structured JSON (Prevents HTML response dumps)
+      return jsonResponse({
+        ok: false,
+        error: globalRouterError.message || "Internal Worker Proxy Exception"
+      }, 200, cors);
     }
   }
 };
