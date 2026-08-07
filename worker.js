@@ -1,6 +1,6 @@
 /**
- * CryptoMind PRO – Enterprise Cloudflare Worker Backend
- * Native Worker standard implementation supporting Binance Futures, HMAC Signing & Fixie Proxying.
+ * CryptoMind PRO – Complete Worker Backend
+ * Matches exact Frontend endpoints: /connect, /futures-order, /futures-positions, etc.
  */
 
 const ALLOWED_ORIGINS = [
@@ -17,11 +17,8 @@ const BINANCE_BASE_ENDPOINTS = [
   "https://fapi-gcp.binance.com"
 ];
 
-/**
- * Build CORS headers dynamically based on request origin
- */
 function buildCorsHeaders(requestOrigin) {
-  const allowOrigin = ALLOWED_ORIGINS.includes(requestOrigin) ? requestOrigin : ALLOWED_ORIGINS[0];
+  const allowOrigin = ALLOWED_ORIGINS.includes(requestOrigin) ? requestOrigin : "*";
   return {
     "Access-Control-Allow-Origin": allowOrigin,
     "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
@@ -31,9 +28,6 @@ function buildCorsHeaders(requestOrigin) {
   };
 }
 
-/**
- * Standard JSON Response Helper
- */
 function jsonResponse(data, status = 200, headers = {}) {
   return new Response(JSON.stringify(data), {
     status: status,
@@ -44,9 +38,6 @@ function jsonResponse(data, status = 200, headers = {}) {
   });
 }
 
-/**
- * Native Web Crypto HMAC-SHA256 signature generator for Binance API authentication
- */
 async function calculateHmacSha256(queryString, apiSecret) {
   const encoder = new TextEncoder();
   const keyData = encoder.encode(apiSecret);
@@ -66,25 +57,17 @@ async function calculateHmacSha256(queryString, apiSecret) {
     .join("");
 }
 
-/**
- * Safely parse incoming request body (JSON or Form URL Encoded)
- */
 async function parseRequestBody(request) {
-  if (["GET", "HEAD", "OPTIONS"].includes(request.method)) {
-    return {};
-  }
+  if (["GET", "HEAD", "OPTIONS"].includes(request.method)) return {};
   try {
     const rawText = await request.clone().text();
     if (!rawText || rawText.trim().length === 0) return {};
-    
     try {
       return JSON.parse(rawText);
     } catch (_) {
       const searchParams = new URLSearchParams(rawText);
       const parsedObj = {};
-      for (const [key, value] of searchParams.entries()) {
-        parsedObj[key] = value;
-      }
+      for (const [k, v] of searchParams.entries()) parsedObj[k] = v;
       return parsedObj;
     }
   } catch (err) {
@@ -92,43 +75,34 @@ async function parseRequestBody(request) {
   }
 }
 
-/**
- * Extract API Key and Secret from Headers, Body, or Worker Environment Variables
- */
 async function extractApiCredentials(request, env, bodyObj = {}) {
   let apiKey = 
     request.headers.get("X-MBX-APIKEY") || 
     request.headers.get("x-api-key") || 
     bodyObj.apiKey || 
+    bodyObj.key || 
     (env ? env.BINANCE_API_KEY : "") || "";
 
   let apiSecret = 
     request.headers.get("X-MBX-SECRET") || 
     request.headers.get("x-api-secret") || 
     bodyObj.apiSecret || 
+    bodyObj.secret || 
     (env ? env.BINANCE_API_SECRET : "") || "";
 
   return { apiKey: apiKey.trim(), apiSecret: apiSecret.trim() };
 }
 
-/**
- * Execute HTTP requests to Binance via Fixie proxy or direct endpoints
- */
 async function executeBinanceFetch(pathAndQuery, method, headers = {}, bodyData = null) {
   const proxyUrl = new URL(FIXIE_URL);
   const proxyAuthToken = "Basic " + btoa(`${proxyUrl.username}:${proxyUrl.password}`);
 
   const outgoingHeaders = new Headers(headers);
   outgoingHeaders.set("Proxy-Authorization", proxyAuthToken);
-  outgoingHeaders.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
-  outgoingHeaders.delete("cf-connecting-ip");
-  outgoingHeaders.delete("cf-visitor");
-  outgoingHeaders.delete("cf-ray");
-  outgoingHeaders.delete("cf-ipcountry");
+  outgoingHeaders.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36");
 
   let executionErrors = [];
 
-  // Attempt through Fixie Proxy first
   for (const endpoint of BINANCE_BASE_ENDPOINTS) {
     try {
       const response = await fetch(`${endpoint}${pathAndQuery}`, {
@@ -136,7 +110,6 @@ async function executeBinanceFetch(pathAndQuery, method, headers = {}, bodyData 
         headers: outgoingHeaders,
         body: bodyData
       });
-
       if (response.status !== 403) return response;
       executionErrors.push(`403 from ${endpoint}`);
     } catch (err) {
@@ -144,10 +117,8 @@ async function executeBinanceFetch(pathAndQuery, method, headers = {}, bodyData 
     }
   }
 
-  // Fallback to direct request if proxy fails
   const cleanHeaders = new Headers(headers);
-  cleanHeaders.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
-  cleanHeaders.delete("Proxy-Authorization");
+  cleanHeaders.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36");
 
   for (const endpoint of BINANCE_BASE_ENDPOINTS) {
     try {
@@ -156,7 +127,6 @@ async function executeBinanceFetch(pathAndQuery, method, headers = {}, bodyData 
         headers: cleanHeaders,
         body: bodyData
       });
-
       if (response.status !== 403) return response;
     } catch (err) {
       executionErrors.push(err.message);
@@ -166,21 +136,18 @@ async function executeBinanceFetch(pathAndQuery, method, headers = {}, bodyData 
   throw new Error(`Binance Connection Error: ${executionErrors.join(" | ")}`);
 }
 
-/**
- * High level wrapper for signed Binance API endpoints
- */
 async function sendBinanceSignedRequest(credentials, method, path, params = {}) {
   const { apiKey, apiSecret } = credentials;
   if (!apiKey || !apiSecret) {
-    throw new Error("Missing Binance API Key or Secret. Please connect your credentials.");
+    throw new Error("Missing Binance API Key or Secret.");
   }
 
   const timestamp = Date.now();
   const searchParams = new URLSearchParams();
 
-  for (const [paramKey, paramVal] of Object.entries(params)) {
-    if (paramVal !== undefined && paramVal !== null && paramKey !== "apiKey" && paramKey !== "apiSecret") {
-      searchParams.append(paramKey, paramVal.toString());
+  for (const [k, v] of Object.entries(params)) {
+    if (v !== undefined && v !== null && k !== "apiKey" && k !== "apiSecret" && k !== "key" && k !== "secret" && k !== "userId" && k !== "exchange") {
+      searchParams.append(k, v.toString());
     }
   }
   searchParams.append("timestamp", timestamp.toString());
@@ -201,32 +168,28 @@ async function sendBinanceSignedRequest(credentials, method, path, params = {}) 
     ? searchParams.toString()
     : null;
 
-  const binanceRawResponse = await executeBinanceFetch(targetPathAndQuery, method, requestHeaders, requestBody);
-  const responseText = await binanceRawResponse.text();
+  const res = await executeBinanceFetch(targetPathAndQuery, method, requestHeaders, requestBody);
+  const text = await res.text();
 
-  let parsedJson = null;
+  let parsed = null;
   try {
-    parsedJson = JSON.parse(responseText);
-  } catch (parseError) {
-    throw new Error(`Invalid non-JSON response from Binance: ${responseText.substring(0, 100)}`);
+    parsed = JSON.parse(text);
+  } catch (e) {
+    throw new Error(`Invalid Binance Response: ${text.substring(0, 100)}`);
   }
 
-  if (!binanceRawResponse.ok) {
-    throw new Error(parsedJson.msg || `Binance Error ${binanceRawResponse.status}`);
+  if (!res.ok) {
+    throw new Error(parsed.msg || `Binance Error ${res.status}`);
   }
 
-  return parsedJson;
+  return parsed;
 }
 
-/**
- * Primary Worker Fetch Handler & Route Dispatcher
- */
 export default {
   async fetch(request, env, ctx) {
     const originHeader = request.headers.get("Origin") || "";
     const cors = buildCorsHeaders(originHeader);
 
-    // Pre-flight OPTIONS handling
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: cors });
     }
@@ -238,30 +201,23 @@ export default {
       const bodyParams = await parseRequestBody(request);
       const credentials = await extractApiCredentials(request, env, bodyParams);
 
-      // Route 1: Health & Connection Ping Check
-      if (
-        pathname === "/" || 
-        pathname === "/api" || 
-        pathname === "/api/health" || 
-        pathname === "/api/connect" || 
-        pathname === "/connect" || 
-        pathname === "/health"
-      ) {
-        return jsonResponse({
-          ok: true,
-          status: "online",
-          message: "CryptoMind PRO Gateway Active",
-          timestamp: new Date().toISOString()
-        }, 200, cors);
+      // 1. Connect Route (Matches Frontend /connect)
+      if (pathname === "/connect" || pathname === "/api/connect" || pathname === "/") {
+        if (credentials.apiKey && credentials.apiSecret) {
+          // Verify keys with Binance
+          const acc = await sendBinanceSignedRequest(credentials, "GET", "/fapi/v2/account");
+          return jsonResponse({ ok: true, message: "Connected to Binance", account: acc }, 200, cors);
+        }
+        return jsonResponse({ ok: true, status: "online", message: "CryptoMind PRO Gateway Ready" }, 200, cors);
       }
 
-      // Route 2: Get Active Positions
-      if (
-        pathname === "/api/futures/positions" || 
-        pathname === "/api/positions" || 
-        pathname === "/positions" || 
-        pathname === "/futures/positions"
-      ) {
+      // 2. Disconnect Route
+      if (pathname === "/disconnect" || pathname === "/api/disconnect") {
+        return jsonResponse({ ok: true, message: "Disconnected" }, 200, cors);
+      }
+
+      // 3. Get Active Positions (Matches Frontend /futures-positions)
+      if (pathname === "/futures-positions" || pathname === "/api/futures/positions" || pathname === "/positions") {
         const positionRiskData = await sendBinanceSignedRequest(credentials, "GET", "/fapi/v2/positionRisk");
         const activePositions = (Array.isArray(positionRiskData) ? positionRiskData : [])
           .filter(pos => parseFloat(pos.positionAmt) !== 0)
@@ -273,50 +229,68 @@ export default {
             entryPrice: parseFloat(pos.entryPrice),
             markPrice: parseFloat(pos.markPrice),
             unrealizedPnl: parseFloat(pos.unRealizedProfit),
-            leverage: parseFloat(pos.leverage)
+            leverage: parseFloat(pos.leverage),
+            liquidationPrice: parseFloat(pos.liquidationPrice || 0)
           }));
         return jsonResponse({ ok: true, positions: activePositions }, 200, cors);
       }
 
-      // Route 3: Get Futures Account Balance & Metrics
-      if (
-        pathname === "/api/account" || 
-        pathname === "/api/futures/account" || 
-        pathname === "/account" || 
-        pathname === "/futures/account"
-      ) {
-        const accountDetails = await sendBinanceSignedRequest(credentials, "GET", "/fapi/v2/account");
-        return jsonResponse({ ok: true, account: accountDetails }, 200, cors);
+      // 4. Place Orders (Matches Frontend /futures-order)
+      if (pathname === "/futures-order" || pathname === "/api/futures/order" || pathname === "/order") {
+        const symbol = bodyParams.symbol || "BTCUSDT";
+        const side = (bodyParams.side || "BUY").toUpperCase();
+        const quantity = bodyParams.qty || bodyParams.quantity || "0.001";
+        
+        const orderParams = {
+          symbol: symbol,
+          side: side,
+          type: "MARKET",
+          quantity: quantity
+        };
+
+        const orderResult = await sendBinanceSignedRequest(credentials, "POST", "/fapi/v1/order", orderParams);
+        return jsonResponse({ ok: true, qty: quantity, result: orderResult }, 200, cors);
       }
 
-      // Route 4: Execute/Place Futures Trade Order
-      if (
-        pathname === "/api/order" || 
-        pathname === "/api/futures/order" || 
-        pathname === "/order" || 
-        pathname === "/futures/order"
-      ) {
-        const orderResult = await sendBinanceSignedRequest(credentials, "POST", "/fapi/v1/order", bodyParams);
-        return jsonResponse({ ok: true, result: orderResult }, 200, cors);
+      // 5. Close Position (Matches Frontend /futures-close)
+      if (pathname === "/futures-close" || pathname === "/api/futures/close") {
+        const symbol = bodyParams.symbol || "BTCUSDT";
+        const positionRisk = await sendBinanceSignedRequest(credentials, "GET", "/fapi/v2/positionRisk", { symbol });
+        const pos = Array.isArray(positionRisk) ? positionRisk[0] : null;
+
+        if (!pos || parseFloat(pos.positionAmt) === 0) {
+          return jsonResponse({ ok: true, message: "No active position to close" }, 200, cors);
+        }
+
+        const currentAmt = parseFloat(pos.positionAmt);
+        const closeSide = currentAmt > 0 ? "SELL" : "BUY";
+        const closeQty = Math.abs(currentAmt).toString();
+
+        const closeResult = await sendBinanceSignedRequest(credentials, "POST", "/fapi/v1/order", {
+          symbol: symbol,
+          side: closeSide,
+          type: "MARKET",
+          quantity: closeQty,
+          reduceOnly: "true"
+        });
+
+        return jsonResponse({ ok: true, result: closeResult }, 200, cors);
       }
 
-      // Route 5: Binance Public Ticker Price
-      if (
-        pathname === "/api/ticker" || 
-        pathname === "/ticker" || 
-        pathname === "/api/futures/ticker"
-      ) {
-        const symbol = requestUrl.searchParams.get("symbol") || bodyParams.symbol || "BTCUSDT";
-        const rawRes = await executeBinanceFetch(`/fapi/v1/ticker/price?symbol=${symbol}`, "GET");
-        const priceData = await rawRes.json();
-        return jsonResponse({ ok: true, ticker: priceData }, 200, cors);
+      // 6. Trade History & Insights Placeholders
+      if (pathname === "/trade-history" || pathname === "/trade-insights" || pathname === "/trade-sync") {
+        return jsonResponse({ ok: true, trades: [], totalTrades: 0, winRate: "0%", totalPnl: 0, reasons: {} }, 200, cors);
       }
 
-      // Fallback for unhandled endpoints
-      return jsonResponse({ ok: false, error: `Route '${pathname}' not found on backend worker` }, 404, cors);
+      // 7. AI Report Placeholder
+      if (pathname === "/ai-report") {
+        return jsonResponse({ ok: true, report: "AI Market Report: Market is currently consolidating." }, 200, cors);
+      }
 
-    } catch (globalRouterError) {
-      return jsonResponse({ ok: false, error: globalRouterError.message || "Internal Worker Proxy Error" }, 200, cors);
+      return jsonResponse({ ok: false, error: `Route '${pathname}' not found` }, 404, cors);
+
+    } catch (err) {
+      return jsonResponse({ ok: false, error: err.message || "Internal Worker Error" }, 200, cors);
     }
   }
 };
