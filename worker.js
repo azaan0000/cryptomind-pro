@@ -1,5 +1,5 @@
 /**
- * CryptoMind PRO — Cloudflare Worker Backend (Direct Headers Bypass)
+ * CryptoMind PRO — Cloudflare Worker Backend (Production Bypass Engine)
  */
 
 const ALLOWED_ORIGINS = [
@@ -59,40 +59,50 @@ async function hmacHex(secret, message) {
   return [...new Uint8Array(sig)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-/* ---------------- Direct Custom Fetch Engine ---------------- */
+/* ---------------- Multi-Node Binance Request Engine ---------------- */
 async function futuresSignedRequest(creds, method, path, params = {}) {
   const timestamp = Date.now();
-  const query = new URLSearchParams({ ...params, timestamp, recvWindow: 5000 }).toString();
+  const query = new URLSearchParams({ ...params, timestamp, recvWindow: 10000 }).toString();
   const sig = await hmacHex(creds.apiSecret, query);
-  
-  const targetUrl = `https://fapi.binance.com${path}?${query}&signature=${sig}`;
 
-  const reqHeaders = {
-    "X-MBX-APIKEY": creds.apiKey,
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "application/json"
-  };
+  const endpoints = [
+    `https://fapi.binance.com${path}?${query}&signature=${sig}`,
+    `https://fapi1.binance.com${path}?${query}&signature=${sig}`,
+    `https://fapi2.binance.com${path}?${query}&signature=${sig}`,
+    `https://fapi3.binance.com${path}?${query}&signature=${sig}`
+  ];
 
-  const res = await fetch(targetUrl, {
-    method: method,
-    headers: reqHeaders
-  });
+  let lastErrorMsg = "Unknown Error";
 
-  const text = await res.text();
+  for (const targetUrl of endpoints) {
+    try {
+      const res = await fetch(targetUrl, {
+        method: method,
+        headers: {
+          "X-MBX-APIKEY": creds.apiKey,
+          "Accept": "application/json",
+          "Content-Type": "application/x-www-form-urlencoded",
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+        }
+      });
 
-  if (text.trim().startsWith("<") || text.includes("<!DOCTYPE") || text.includes("<html")) {
-    throw new Error("Binance API Blocked. Ensure API Key IP restriction is set to Unrestricted on Binance.");
-  }
+      const text = await res.text();
 
-  try {
-    const data = JSON.parse(text);
-    if (data.code && data.code < 0) {
-      throw new Error(`Binance API Error (${data.code}): ${data.msg}`);
+      if (!text.trim().startsWith("<") && !text.includes("<!DOCTYPE") && !text.includes("<html")) {
+        const data = JSON.parse(text);
+        if (data.code && data.code < 0) {
+          throw new Error(`Binance API Error (${data.code}): ${data.msg}`);
+        }
+        return data;
+      } else {
+        lastErrorMsg = "Binance WAF blocked request. Ensure API Key IP restriction is set to Unrestricted.";
+      }
+    } catch (e) {
+      lastErrorMsg = e.message;
     }
-    return data;
-  } catch (err) {
-    throw new Error("Invalid Binance response: " + err.message);
   }
+
+  throw new Error(lastErrorMsg);
 }
 
 /* ---------------- AI Report ---------------- */
@@ -215,13 +225,9 @@ async function handleFuturesOrder(request, env, headers) {
   try {
     const creds = await getCreds(env, userId, exchange || "binance");
     
-    // Leverage Set
     await futuresSignedRequest(creds, "POST", "/fapi/v1/leverage", { symbol, leverage });
 
-    // Price Fetch Direct
-    const targetPriceUrl = `https://fapi.binance.com/fapi/v1/ticker/price?symbol=${symbol}`;
-    const priceResp = await fetch(targetPriceUrl, { headers: { "User-Agent": "Mozilla/5.0" } });
-    const priceData = await priceResp.json();
+    const priceData = await futuresSignedRequest(creds, "GET", "/fapi/v1/ticker/price", { symbol });
     const currentPrice = parseFloat(priceData.price);
 
     const positionValue = parseFloat(marginUsd) * parseFloat(leverage);
