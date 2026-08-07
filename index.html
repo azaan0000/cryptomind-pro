@@ -2488,5 +2488,43 @@ function calcLeverage(){
   setInterval(syncAndLoadTrades,90*1000); // reconcile journal against Binance periodically
 })();
 </script>
+  <script>
+  document.addEventListener("DOMContentLoaded", function () {
+    // 1. Input fields aur Buttons ko Unke Attributes se Dhoondna
+    const keyInput = document.querySelector('input[placeholder*="API Key"]') || document.querySelector('input[type="text"]');
+    const secretInput = document.querySelector('input[placeholder*="Secret"]') || document.querySelector('input[type="password"]');
+    
+    // Connect aur Disconnect buttons ko find karna
+    const allButtons = Array.from(document.querySelectorAll('button'));
+    const connectBtn = allButtons.find(b => b.textContent.trim().toLowerCase().includes('connect') && !b.textContent.trim().toLowerCase().includes('disconnect'));
+    const disconnectBtn = allButtons.find(b => b.textContent.trim().toLowerCase().includes('disconnect'));
+
+    // 2. Refresh hone par Saved Keys Auto-Fill karna
+    const savedKey = localStorage.getItem("cm_apiKey");
+    const savedSecret = localStorage.getItem("cm_apiSecret");
+
+    if (savedKey && keyInput) keyInput.value = savedKey;
+    if (savedSecret && secretInput) secretInput.value = savedSecret;
+
+    // 3. Jab User Connect Dabaey -> Keys Clear / Save hona
+    if (connectBtn) {
+      connectBtn.addEventListener("click", function () {
+        if (keyInput && secretInput && keyInput.value && secretInput.value) {
+          localStorage.setItem("cm_apiKey", keyInput.value);
+          localStorage.setItem("cm_apiSecret", secretInput.value);
+        }
+      });
+    }
+
+    // 4. Jab User Disconnect Dabaey -> Storage Clear hona
+    if (disconnectBtn) {
+      disconnectBtn.addEventListener("click", function () {
+        localStorage.removeItem("cm_apiKey");
+        localStorage.removeItem("cm_apiSecret");
+      });
+    }
+  });
+</script>
 </body>
 </html>
+
