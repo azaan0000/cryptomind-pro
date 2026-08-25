@@ -1,7 +1,0 @@
-name = "cryptomind-pro-backend"
-main = "worker.js"
-compatibility_date = "2024-11-01"
-
-[[kv_namespaces]]
-binding = "ACCOUNTS_KV"
-id = "73806d1127ae4c0295a9c85a4defb7f9"
