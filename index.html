@@ -1520,14 +1520,19 @@ function generateSignal(ind,symbol,candles,opts){
   const htfLong=htfTFs.filter(tf=>htfData[tf]==='LONG').length;
   const htfShort=htfTFs.filter(tf=>htfData[tf]==='SHORT').length;
   let htfVeto=false;
+  // 🛠️ TIGHTENED (backtest-informed, 2026-08-31): every strategy variant tested
+  // against real BTC data underperformed simple buy-and-hold, and the common
+  // thread was overtrading — too many marginal setups. This gate now requires
+  // ACTIVE majority agreement from the higher timeframes (2+ of the 3 must
+  // confirm the direction), not just "not opposed." Fewer trades, higher bar.
   if(applyGates&&direction!=='HOLD'&&htfTFs.length>=2){
-    if(direction==='LONG'&&htfShort>=2){htfVeto=true;}
-    if(direction==='SHORT'&&htfLong>=2){htfVeto=true;}
+    if(direction==='LONG'&&htfLong<2){htfVeto=true;}
+    if(direction==='SHORT'&&htfShort<2){htfVeto=true;}
   }
   if(htfLong>=2&&!htfVeto){reasons.push({t:'ok',txt:`✅ ${htfLong}/3 higher TFs bullish`});}
   if(htfShort>=2&&!htfVeto){reasons.push({t:'ok',txt:`✅ ${htfShort}/3 higher TFs bearish`});}
   if(htfVeto){
-    warnings.push({t:'warn',txt:`🚫 Blocked — counter-trend vs higher timeframes (${direction==='LONG'?htfShort:htfLong}/3 disagree)`});
+    warnings.push({t:'warn',txt:`🚫 Blocked — needs 2+ higher timeframes actively confirming (have ${direction==='LONG'?htfLong:htfShort}/3)`});
     direction='HOLD'; label='HOLD';
   }
 
@@ -2126,7 +2131,7 @@ function checkAutoTrade(sig){
 
   const lastDir=state.autoTradeLastDir[state.symbol];
   if(lastDir===sig.direction) return; // already traded this exact signal
-  if(sig.confidence<60) return; // bot only takes high-confidence setups
+  if(sig.confidence<80) return; // 🛠️ TIGHTENED (backtest-informed, 2026-08-31): raised from 60 — matches the real bot's threshold now
 
   // 🛠️ FIX: the lastDir check above only blocks a REPEATED identical signal —
   // if the signal flickers even briefly (e.g. LONG→HOLD→LONG in a choppy
@@ -2775,7 +2780,7 @@ async function checkRealAutoTrade(sig,symbol,timeframe){
   checkDailyReset();
   if(Date.now()<state.botCooldownUntil) return;
   if(sig.direction==='HOLD'||!sig.entry) return;
-  if(sig.confidence<70) return; // raised from 60 — only take higher-conviction setups for real money
+  if(sig.confidence<80) return; // 🛠️ TIGHTENED (backtest-informed, 2026-08-31): raised from 70 — every tested variant that traded more often did worse; fewer, stronger setups only
 
   const lastDir=realAutoLastDir[symbol];
   if(lastDir===sig.direction) return;
