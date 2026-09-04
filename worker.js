@@ -73,6 +73,7 @@ export default {
       if (url.pathname === "/bot-config" && request.method === "POST") return await handleBotConfigSet(request, env, headers);
       if (url.pathname === "/bot-config" && request.method === "GET") return await handleBotConfigGet(url, env, headers);
       if (url.pathname === "/bot-log" && request.method === "GET") return await handleBotLogGet(url, env, headers);
+      if (url.pathname === "/paper-status" && request.method === "GET") return await handlePaperStatusGet(url, env, headers);
 
       return new Response(JSON.stringify({ error: "Not found" }), { status: 404, headers: { ...headers, "Content-Type": "application/json" } });
     } catch (err) {
@@ -1022,23 +1023,20 @@ async function appendBotLog(env, entry){
   }catch(e){}
 }
 
-/* ── The scan itself — runs every cron tick ── */
+/* ── The scan itself — runs every cron tick, ALWAYS (paper sim doesn't need
+   the real-money bot to be on). Real-money trading is gated further down. ── */
 async function runAutoTradeScan(env){
   const configRaw = await env.ACCOUNTS_KV.get('bot_config');
-  if(!configRaw) return;
-  const config = JSON.parse(configRaw);
-  if(!config.userId || !config.realAutoTrade || !config.riskAccepted) return; // 🛠️ FIX: no log write for this — it's the normal idle state most of the time, and was burning a KV write every single tick for nothing
+  const config = configRaw ? JSON.parse(configRaw) : {};
 
   // 🛠️ FIX: scan FIRST (plain HTTP candle fetches — no KV/relay involved at
   // all), and only touch the relay (positions/balance check) afterwards, and
-  // only if something actually qualified. Previously this ran a relay
-  // round-trip for positions AND balance on every single tick regardless of
-  // whether there was ever going to be a trade — each relay round-trip costs
-  // several KV writes (job queue + phone "sent" ack + phone "done" result),
-  // so at a 1-minute cron that alone blew through Cloudflare's free-tier KV
-  // daily write quota (1,000/day) in a few hours and locked the whole
-  // account out of KV until the daily reset.
+  // only if real trading is actually enabled AND something qualified. Each
+  // relay round-trip costs several KV writes (job queue + phone "sent" ack +
+  // phone "done" result), so doing this unconditionally on every tick is
+  // what blew through Cloudflare's free-tier KV daily write quota before.
   const candidates = [];
+  const latestPrices = {}; // 🆕 captured for every scanned coin, not just qualifying ones — feeds the paper simulator below without extra fetches
   await Promise.all(WATCHLIST.map(async (coin)=>{
     try{
       const [c5m,c1h,c4h,c1d] = await Promise.all([
@@ -1048,6 +1046,7 @@ async function runAutoTradeScan(env){
         fetchCandlesW(coin.sym,'1d'),
       ]);
       if(!c5m||c5m.length<60) return;
+      latestPrices[coin.sym] = c5m[c5m.length-1].close;
 
       const htfData = {};
       for(const [tf,c] of [['1h',c1h],['4h',c4h],['1d',c1d]]){
@@ -1068,8 +1067,17 @@ async function runAutoTradeScan(env){
     }catch(e){ /* one coin failing shouldn't stop the whole scan */ }
   }));
 
+  // 🆕 Paper simulation ALWAYS runs, all 22 coins, every tick — regardless of
+  // whether the real-money bot is on. This is what makes paper trading a
+  // genuine always-on background test of the exact same engine that would
+  // place real orders, instead of only reacting to whatever coin happens to
+  // be on-screen in the browser.
+  await runPaperSim(env, candidates, latestPrices);
+
+  if(!config.userId || !config.realAutoTrade || !config.riskAccepted) return; // real-money bot not enabled — paper sim above already ran, nothing more to do
+
   if(candidates.length===0){
-    await appendBotLog(env,{ scanned:WATCHLIST.length, qualifying:0, opened:0 }); // 🛠️ FIX: heartbeat so the log proves the scanner is alive even on quiet ticks — cheap (one plain KV write, no relay round-trip), so it doesn't reintroduce the old quota problem
+    await appendBotLog(env,{ scanned:WATCHLIST.length, qualifying:0, opened:0 }); // 🛠️ FIX: heartbeat so the log proves the scanner is alive even on quiet ticks
     return;
   }
 
@@ -1144,4 +1152,106 @@ async function runAutoTradeScan(env){
   }
 
   await appendBotLog(env,{ scanned:scanList.length, qualifying:candidates.length, opened:opened.length, mode:config.liveTrading?'live':'shadow', trades:opened });
+}
+
+/* ================================================================
+   🆕 SERVER-SIDE PAPER TRADING SIMULATOR
+   ------------------------------------------------------------
+   Runs on every cron tick, all 22 watchlist coins, completely
+   independent of phone/browser being open. Uses the SAME signal
+   engine and gates as real trading, so it's a genuine live-fire
+   test of "would this have made money" before committing real
+   capital. Starts at $10 (matching intended real deposit), 3x
+   leverage, 0.04% taker fee on both entry and exit (matches real
+   Binance USDT-M futures), max 3 concurrent positions, one
+   position per symbol at a time — same shape as the real bot.
+   ================================================================ */
+
+const PAPER_FEE_RATE = 0.0004;
+const PAPER_START_BALANCE = 10;
+const PAPER_LEVERAGE = 3;
+
+async function loadPaperAccount(env){
+  const raw = await env.ACCOUNTS_KV.get('paper_account');
+  if(!raw) return { balance: PAPER_START_BALANCE, positions: [], history: [] };
+  try{ return JSON.parse(raw); }catch(e){ return { balance: PAPER_START_BALANCE, positions: [], history: [] }; }
+}
+
+async function runPaperSim(env, candidates, latestPrices){
+  const acct = await loadPaperAccount(env);
+  let changed = false;
+
+  // 1) Check existing open paper positions for SL/TP/liquidation at current price
+  const stillOpen = [];
+  for(const p of acct.positions){
+    const price = latestPrices[p.symbol];
+    if(!price){ stillOpen.push(p); continue; } // no fresh price this tick — leave it, check next tick
+    const isLong = p.side==='LONG';
+    const margin = p.margin;
+
+    // Partial TP1 (once)
+    if(p.tp1 && p.tp2 && !p.scaledOut){
+      const hitTP1 = isLong ? price>=p.tp1 : price<=p.tp1;
+      if(hitTP1){
+        const halfSize = p.size/2;
+        const pnl = halfSize*(Math.abs(p.tp1-p.entry)/p.entry);
+        const exitFee = halfSize*PAPER_FEE_RATE;
+        const marginBack = margin/2;
+        acct.balance = +(acct.balance + pnl - exitFee + marginBack).toFixed(4);
+        acct.history.unshift({ symbol:p.symbol, side:p.side, entry:p.entry, exit:price, pnl:+(pnl-exitFee).toFixed(4), reason:'TP1 Hit (50% closed)', at: Date.now() });
+        p.size = halfSize; p.margin = margin/2; p.sl = p.entry; p.tp = p.tp2; p.scaledOut = true;
+        changed = true;
+      }
+    }
+
+    const slLevel = p.sl, tpLevel = p.tp || p.tp1;
+    const hitSL = isLong ? price<=slLevel : price>=slLevel;
+    const hitTP = isLong ? price>=tpLevel : price<=tpLevel;
+    if(hitSL || hitTP){
+      let reason = p.scaledOut ? 'Final TP2 Hit' : (hitTP ? 'TP Hit' : 'SL Hit');
+      let pnl = hitTP
+        ? p.size*(Math.abs(tpLevel-p.entry)/p.entry)
+        : -(p.size*(Math.abs(slLevel-p.entry)/p.entry));
+      const exitFee = p.size*PAPER_FEE_RATE;
+      pnl -= exitFee;
+      if(pnl < -p.margin){ pnl = -p.margin; reason = 'Liquidated'; }
+      if(p.scaledOut && hitSL) reason = 'Breakeven Exit (risk-free)';
+      acct.balance = +(acct.balance + pnl + p.margin).toFixed(4);
+      acct.history.unshift({ symbol:p.symbol, side:p.side, entry:p.entry, exit:price, pnl:+pnl.toFixed(4), reason, at: Date.now() });
+      changed = true;
+      continue; // closed — don't push back to stillOpen
+    }
+    stillOpen.push(p);
+  }
+  acct.positions = stillOpen;
+  acct.history = acct.history.slice(0, 50); // keep it bounded
+
+  // 2) Open new paper positions from this tick's candidates
+  const openSymbols = new Set(acct.positions.map(p=>p.symbol));
+  const slots = 3 - acct.positions.length;
+  if(slots>0){
+    const fresh = candidates.filter(c=>!openSymbols.has(c.symbol)).sort((a,b)=>b.confidence-a.confidence).slice(0, slots);
+    for(const c of fresh){
+      const margin = Math.min(10, acct.balance*0.3); // same 30%-of-balance cap the client bot uses
+      if(margin < 1) continue;
+      const size = margin*PAPER_LEVERAGE;
+      const entryFee = size*PAPER_FEE_RATE;
+      if(margin+entryFee > acct.balance) continue;
+      acct.balance = +(acct.balance - margin - entryFee).toFixed(4);
+      acct.positions.push({
+        symbol:c.symbol, side:c.direction, entry:c.entry, sl:c.sl, tp1:c.tp1, tp2:c.tp2,
+        margin, leverage:PAPER_LEVERAGE, size, scaledOut:false, confidence:c.confidence, openedAt: Date.now(),
+      });
+      changed = true;
+    }
+  }
+
+  if(changed){
+    await env.ACCOUNTS_KV.put('paper_account', JSON.stringify(acct));
+  }
+}
+
+async function handlePaperStatusGet(url, env, headers){
+  const acct = await loadPaperAccount(env);
+  return new Response(JSON.stringify(acct), { headers: { ...headers, "Content-Type": "application/json" } });
 }

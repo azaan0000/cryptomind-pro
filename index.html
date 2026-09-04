@@ -437,12 +437,32 @@ select:focus,.form-row input:focus,.form-row select:focus{outline:2px solid rgba
     </div>
   </div>
 
+  <!-- 🆕 Cloud Paper Bot — always-on, server-side, scans all 22 coins every ~3min regardless of phone/browser state -->
+  <div style="background:var(--panel2);border:1px solid var(--blue);border-radius:10px;padding:10px;margin-bottom:12px;">
+    <div style="display:flex;align-items:center;justify-content:space-between;">
+      <div>
+        <div style="font-size:12px;font-weight:700;color:var(--blue)">☁️ Cloud Paper Bot (always-on, all coins)</div>
+        <div style="font-size:10px;color:var(--sub);margin-top:2px" id="cloudPaperStatus">Loading...</div>
+      </div>
+      <button class="btn btn-blue" id="cloudPaperRefresh" style="padding:4px 10px;font-size:10px">Refresh</button>
+    </div>
+    <div class="pt-stats" style="margin-top:8px">
+      <div class="pt-stat"><div class="pt-stat-val" id="cpBalance">$10.00</div><div class="pt-stat-lbl">Balance</div></div>
+      <div class="pt-stat"><div class="pt-stat-val" id="cpWinRate">0%</div><div class="pt-stat-lbl">Win Rate</div></div>
+      <div class="pt-stat"><div class="pt-stat-val" id="cpOpenCount">0</div><div class="pt-stat-lbl">Open</div></div>
+    </div>
+    <div id="cloudPaperHistory" style="font-size:10px;color:var(--sub);margin-top:8px;max-height:120px;overflow-y:auto"></div>
+    <div style="font-size:9px;color:var(--sub);margin-top:6px">This runs the SAME signal engine as real trading, scanning all 22 coins on Cloudflare's servers every ~3min — testing whether it would actually make money before you commit real capital. Starts at $10 to match a real deposit.</div>
+  </div>
+
   <div class="pt-stats">
-    <div class="pt-stat"><div class="pt-stat-val" id="ptBalance">$10,000</div><div class="pt-stat-lbl">Balance</div></div>
+    <div class="pt-stat"><div class="pt-stat-val" id="ptBalance">$10.00</div><div class="pt-stat-lbl">Balance</div></div>
     <div class="pt-stat"><div class="pt-stat-val" id="ptWinRate">0%</div><div class="pt-stat-lbl">Win Rate</div></div>
     <div class="pt-stat"><div class="pt-stat-val" id="ptOpenCount">0</div><div class="pt-stat-lbl">Open</div></div>
   </div>
+  <div style="font-size:9px;color:var(--sub);margin-top:-6px;margin-bottom:4px">Local — only reacts to whichever coin is on-screen right now. For always-on, all-coin testing, see the Cloud Paper Bot above.</div>
   <div class="section-lbl" style="margin-top:4px">Manual Trade</div>
+
   <div class="form-row">
     <select id="ptSide"><option value="long">LONG</option><option value="short">SHORT</option></select>
     <input type="number" id="ptSize" value="10" placeholder="Margin $">
@@ -877,6 +897,8 @@ function ichimoku(candles){
   };
 }
 
+const PAPER_FEE_RATE=0.0004; // 🆕 0.04% taker fee, matching real Binance USDT-M futures — charged on notional, both entry and exit, so paper results reflect what real trading would actually cost
+
 function fmtPrice(p){
   if(!p||isNaN(p)) return '--';
   if(p>=1000) return p.toLocaleString(undefined,{maximumFractionDigits:2});
@@ -899,6 +921,30 @@ async function syncBotConfig(){
       liveTrading:document.getElementById('liveTradingToggle').checked,
     })});
   }catch(e){ /* best-effort — cron will just use its last-known config if this fails */ }
+}
+
+async function loadCloudPaperStatus(){
+  try{
+    const acct=await fetch(BACKEND_URL+'/paper-status').then(r=>r.json());
+    document.getElementById('cpBalance').textContent='$'+(acct.balance||0).toFixed(2);
+    document.getElementById('cpOpenCount').textContent=(acct.positions||[]).length;
+    const hist=acct.history||[];
+    const wins=hist.filter(h=>h.pnl>0).length;
+    document.getElementById('cpWinRate').textContent=hist.length?Math.round(wins/hist.length*100)+'%':'0%';
+    document.getElementById('cloudPaperStatus').textContent=`Scanning all 22 coins every ~3min — ${(acct.positions||[]).length} open, ${hist.length} closed so far`;
+    const histEl=document.getElementById('cloudPaperHistory');
+    if(hist.length){
+      histEl.innerHTML=hist.slice(0,8).map(h=>{
+        const t=new Date(h.at).toLocaleTimeString();
+        const color=h.pnl>=0?'var(--accent)':'var(--red)';
+        return `<div>${t} — ${h.symbol} ${h.side} <span style="color:${color}">${h.pnl>=0?'+':''}${h.pnl.toFixed(2)}$</span> (${h.reason})</div>`;
+      }).join('');
+    } else {
+      histEl.innerHTML='<div>No closed trades yet.</div>';
+    }
+  }catch(e){
+    document.getElementById('cloudPaperStatus').textContent='Could not reach cloud paper bot';
+  }
 }
 
 async function loadCloudScanStatus(){
@@ -2015,6 +2061,8 @@ function openTrade(){
     return;
   }
   state.ptBalance=+(state.ptBalance-size).toFixed(2);
+  const entryFee=+(positionValue*PAPER_FEE_RATE).toFixed(4); // 🆕 real Binance charges this on entry too
+  state.ptBalance=+(state.ptBalance-entryFee).toFixed(2);
 
   state.ptOpen.push({
     id:Date.now(),
@@ -2057,12 +2105,13 @@ function checkAllPaperTrades(){
       if(hitTP1){
         const halfSize=t.size/2;
         const pnl=+(halfSize*(Math.abs(t.tp1-t.entry)/t.entry)).toFixed(4);
+        const exitFee=+(halfSize*PAPER_FEE_RATE).toFixed(4); // 🆕 real exit fee on the portion being closed
         const marginBack=margin/2;
         t.marginReleased=marginBack;
-        state.ptBalance=+(state.ptBalance+pnl+marginBack).toFixed(2);
-        recordBotResult(pnl);
-        state.ptHist.unshift({symbol:t.symbol,side:t.side,entry:t.entry,exit:symPrice,pnl,closedAt:new Date().toLocaleTimeString(),reason:'TP1 Hit (50% closed)'});
-        showToast(`🎯 ${t.symbol} TP1 hit — 50% closed +${pnl.toFixed(2)}$, SL moved to breakeven`,'buy');
+        state.ptBalance=+(state.ptBalance+pnl-exitFee+marginBack).toFixed(2);
+        recordBotResult(pnl-exitFee);
+        state.ptHist.unshift({symbol:t.symbol,side:t.side,entry:t.entry,exit:symPrice,pnl:+(pnl-exitFee).toFixed(4),closedAt:new Date().toLocaleTimeString(),reason:'TP1 Hit (50% closed)'});
+        showToast(`🎯 ${t.symbol} TP1 hit — 50% closed +${(pnl-exitFee).toFixed(2)}$, SL moved to breakeven`,'buy');
         t.size=halfSize;
         t.margin=margin/2;
         t.sl=t.entry; // risk-free now
@@ -2081,6 +2130,8 @@ function checkAllPaperTrades(){
       let pnl=hitTP
         ?+(t.size*(Math.abs(tpLevel-t.entry)/t.entry)).toFixed(4)
         :-(t.size*(Math.abs(slLevel-t.entry)/t.entry)).toFixed(4);
+      const exitFee=+(t.size*PAPER_FEE_RATE).toFixed(4); // 🆕 real exit fee
+      pnl=+(pnl-exitFee).toFixed(4);
       // 🛡️ Cap loss at margin — can never lose more than you put in (like real liquidation)
       if(pnl<-margin){ pnl=-margin; reason='Liquidated'; }
       if(t.scaledOut&&hitSL) reason='Breakeven Exit (risk-free)';
@@ -2164,6 +2215,8 @@ function checkAutoTrade(sig){
   if(BOT_MARGIN<1){ return; } // balance too low — NOT marked as traded, so this signal can retry once balance allows
   state.autoTradeLastDir[state.symbol]=sig.direction;
   state.ptBalance=+(state.ptBalance-BOT_MARGIN).toFixed(2); // reserve margin now — released back on close
+  const botEntryFee=+(BOT_MARGIN*BOT_LEVERAGE*PAPER_FEE_RATE).toFixed(4); // 🆕 real entry fee
+  state.ptBalance=+(state.ptBalance-botEntryFee).toFixed(2);
   state.ptOpen.push({
     id:Date.now()+Math.random(),
     symbol:state.symbol,side,
@@ -2244,6 +2297,8 @@ function closeTradeManually(id){
   if(!price){showToast('No price — try again','sell');return;}
   const margin=t.margin||t.size;
   let pnl=+((t.side==='long'?price-t.entry:t.entry-price)/t.entry*t.size).toFixed(2);
+  const exitFee=+(t.size*PAPER_FEE_RATE).toFixed(4); // 🆕 real exit fee
+  pnl=+(pnl-exitFee).toFixed(2);
   if(pnl<-margin) pnl=-margin; // can't lose more than margin invested
   const marginBack=margin; // 🛠️ FIX: same double-subtraction bug as checkAllPaperTrades — t.margin already reflects only what's still reserved
   state.ptBalance=+(state.ptBalance+pnl+marginBack).toFixed(2);
@@ -2255,7 +2310,7 @@ function closeTradeManually(id){
 }
 
 function resetPT(){
-  if(!confirm('Reset all paper trades and balance to $10,000?')) return;
+  if(!confirm('Reset all paper trades and balance to $10?')) return; // 🛠️ FIX: label said $10,000 but always actually reset to $10 — matches real starting capital now, text was just wrong
   state.ptOpen=[];state.ptHist=[];state.ptBalance=10;
   renderPT();saveState();showToast('Paper trading reset');
 }
@@ -2934,6 +2989,7 @@ function initSelectors(){
   });
   document.getElementById('realMargin').addEventListener('change',()=>syncBotConfig());
   document.getElementById('cloudScanRefresh').addEventListener('click',()=>loadCloudScanStatus());
+  document.getElementById('cloudPaperRefresh').addEventListener('click',()=>loadCloudPaperStatus());
   // 🛠️ FIX: restore both toggles from saved state on page load — previously always started OFF
   if(state.riskAccepted){
     document.getElementById('riskOk').checked=true;
@@ -2949,7 +3005,9 @@ function initSelectors(){
   // 🆕 push current state to the cloud scanner once on load, then start polling its status/log
   syncBotConfig();
   loadCloudScanStatus();
+  loadCloudPaperStatus();
   setInterval(loadCloudScanStatus,30000);
+  setInterval(loadCloudPaperStatus,30000);
   document.getElementById('autoTradeToggle').addEventListener('change',e=>{
     state.autoTrade=e.target.checked;
     if(state.autoTrade){
