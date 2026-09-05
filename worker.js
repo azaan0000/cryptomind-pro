@@ -868,7 +868,8 @@ function computeIndicatorsW(candles){
 // hard gates (HTF alignment + SMC reaction zone), same trade-plan
 // math. Difference: htfData/deriv/news are passed in as params
 // instead of read from browser globals, since this runs server-side.
-function generateSignalW(ind, symbol, candles, htfData, deriv){
+function generateSignalW(ind, symbol, candles, htfData, deriv, applyGates){
+  if(applyGates===undefined) applyGates=true; // 🛠️ FIX (2026-09-03): the inner per-timeframe calls used to compute htfData['1h']/['4h']/['1d'] were ALWAYS applying the HTF+SMC hard gates too — meaning a higher timeframe could basically never register as LONG/SHORT (SMC reaction-zone proximity is rare on any given check), so htfLong/htfShort stayed at 0 and the tightened "need 2+ HTFs to actively agree" gate vetoed EVERY signal, on every coin, every tick. That's why confidence could show 95% and still never open a trade. Scan loop below now passes applyGates=false for those inner calls, matching how the client computes them.
   if(!ind) return{direction:'HOLD',confidence:0};
   const p=ind.price;
   let score=0;
@@ -919,13 +920,13 @@ function generateSignalW(ind, symbol, candles, htfData, deriv){
   const htfTFs=['1h','4h','1d'].filter(tf=>htfData[tf]);
   const htfLong=htfTFs.filter(tf=>htfData[tf]==='LONG').length;
   const htfShort=htfTFs.filter(tf=>htfData[tf]==='SHORT').length;
-  if(direction!=='HOLD'&&htfTFs.length>=2){
+  if(applyGates&&direction!=='HOLD'&&htfTFs.length>=2){
     if(direction==='LONG'&&htfLong<2) direction='HOLD';
     if(direction==='SHORT'&&htfShort<2) direction='HOLD';
   }
 
   // Hard gate 2: SMC reaction zone must agree
-  if(direction!=='HOLD'&&candles&&candles.length>=30){
+  if(applyGates&&direction!=='HOLD'&&candles&&candles.length>=30){
     const smc=detectSMC(candles);
     const wantBull=direction==='LONG';
     const nearOB=smc.ob&&smc.ob.bias===(wantBull?'bullish':'bearish')&&p>=smc.ob.low*0.997&&p<=smc.ob.high*1.003;
@@ -1037,6 +1038,8 @@ async function runAutoTradeScan(env){
   // what blew through Cloudflare's free-tier KV daily write quota before.
   const candidates = [];
   const latestPrices = {}; // 🆕 captured for every scanned coin, not just qualifying ones — feeds the paper simulator below without extra fetches
+  let successCount = 0; // 🆕 diagnostic: how many coins actually got usable candle data this tick
+  let topSignal = null; // 🆕 diagnostic: strongest signal seen this tick even if it didn't qualify — proves whether the engine is "seeing" strong setups
   await Promise.all(WATCHLIST.map(async (coin)=>{
     try{
       const [c5m,c1h,c4h,c1d] = await Promise.all([
@@ -1046,6 +1049,7 @@ async function runAutoTradeScan(env){
         fetchCandlesW(coin.sym,'1d'),
       ]);
       if(!c5m||c5m.length<60) return;
+      successCount++;
       latestPrices[coin.sym] = c5m[c5m.length-1].close;
 
       const htfData = {};
@@ -1053,7 +1057,7 @@ async function runAutoTradeScan(env){
         if(!c||c.length<60) continue;
         const ind=computeIndicatorsW(c);
         if(!ind) continue;
-        const s=generateSignalW(ind,coin.sym,c,{},null); // gate:false-equivalent — no HTF/SMC recursion for the HTF calc itself
+        const s=generateSignalW(ind,coin.sym,c,{},null,false); // 🛠️ FIX: applyGates=false — this is just "what's the trend on this timeframe", not a tradeable signal, so it must NOT be filtered by the HTF/SMC gates (those gates are what THIS calculation feeds into). Missing this was the actual bug: htfData collapsed to HOLD almost always, so the tightened HTF-alignment gate vetoed every signal, every tick.
         htfData[tf]=s.direction;
       }
 
@@ -1061,11 +1065,15 @@ async function runAutoTradeScan(env){
       if(!ind5m) return;
       const deriv = await fetchDerivativesW(coin.sym);
       const sig = generateSignalW(ind5m, coin.sym, c5m, htfData, deriv);
+      if(!topSignal || sig.confidence>topSignal.confidence){
+        topSignal = { symbol:coin.sym, direction:sig.direction, confidence:sig.confidence };
+      }
       if(sig.direction!=='HOLD' && sig.confidence>=80){ // 🛠️ TIGHTENED (backtest-informed, 2026-08-31): raised from 70
         candidates.push({ symbol:coin.sym, ...sig });
       }
     }catch(e){ /* one coin failing shouldn't stop the whole scan */ }
   }));
+
 
   // 🆕 Paper simulation ALWAYS runs, all 22 coins, every tick — regardless of
   // whether the real-money bot is on. This is what makes paper trading a
@@ -1077,7 +1085,7 @@ async function runAutoTradeScan(env){
   if(!config.userId || !config.realAutoTrade || !config.riskAccepted) return; // real-money bot not enabled — paper sim above already ran, nothing more to do
 
   if(candidates.length===0){
-    await appendBotLog(env,{ scanned:WATCHLIST.length, qualifying:0, opened:0 }); // 🛠️ FIX: heartbeat so the log proves the scanner is alive even on quiet ticks
+    await appendBotLog(env,{ scanned:WATCHLIST.length, dataOk:successCount, qualifying:0, opened:0, top:topSignal }); // 🆕 dataOk shows how many of 22 coins actually returned usable candle data; top shows the strongest signal seen even if it didn't qualify — makes future discrepancies visible instead of silent
     return;
   }
 

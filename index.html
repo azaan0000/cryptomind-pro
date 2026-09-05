@@ -965,7 +965,9 @@ async function loadCloudScanStatus(){
         if(e.skipped) return `<div>${t} — skipped: ${e.skipped}</div>`;
         if(e.error) return `<div style="color:var(--red)">${t} — error: ${e.error}</div>`;
         const trades=(e.trades||[]).map(tr=>`${tr.symbol} ${tr.side}${tr.shadowOnly?' (shadow)':tr.ok?' ✅':' ❌'}`).join(', ');
-        return `<div>${t} — scanned ${e.scanned}, qualifying ${e.qualifying}${trades?': '+trades:''}</div>`;
+        const dataInfo=e.dataOk!=null?` (data ok: ${e.dataOk}/${e.scanned})`:'';
+        const topInfo=e.top?` | strongest seen: ${e.top.symbol} ${e.top.direction} ${e.top.confidence}%`:'';
+        return `<div>${t} — scanned ${e.scanned}${dataInfo}, qualifying ${e.qualifying}${trades?': '+trades:''}${topInfo}</div>`;
       }).join('');
     } else {
       logEl.innerHTML='<div>No scans logged yet.</div>';
