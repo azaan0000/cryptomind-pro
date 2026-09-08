@@ -86,7 +86,17 @@ export default {
   // open. This is what makes real-money auto-trading actually "always
   // on" instead of only working while the app tab is in the foreground.
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(runAutoTradeScan(env));
+    ctx.waitUntil(
+      runAutoTradeScan(env).catch(async (err) => {
+        // 🛠️ CRITICAL FIX (2026-09-08): if the scan threw ANYWHERE, it used to
+        // just vanish — no log entry, nothing. That made "is this even
+        // running?" impossible to answer from the app. Now any crash gets
+        // written to bot_log so it's visible instead of silent.
+        try {
+          await appendBotLog(env, { error: 'SCAN CRASHED: ' + (err && err.message ? err.message : String(err)), stack: err && err.stack ? String(err.stack).slice(0,500) : null });
+        } catch(e2) { /* even the crash-logger failing shouldn't throw further */ }
+      })
+    );
   },
 };
 
@@ -1080,7 +1090,7 @@ async function runAutoTradeScan(env){
   // genuine always-on background test of the exact same engine that would
   // place real orders, instead of only reacting to whatever coin happens to
   // be on-screen in the browser.
-  await runPaperSim(env, candidates, latestPrices);
+  await runPaperSim(env, candidates, latestPrices, { successCount, topSignal });
 
   if(!config.userId || !config.realAutoTrade || !config.riskAccepted) return; // real-money bot not enabled — paper sim above already ran, nothing more to do
 
@@ -1185,9 +1195,16 @@ async function loadPaperAccount(env){
   try{ return JSON.parse(raw); }catch(e){ return { balance: PAPER_START_BALANCE, positions: [], history: [] }; }
 }
 
-async function runPaperSim(env, candidates, latestPrices){
+async function runPaperSim(env, candidates, latestPrices, diag){
   const acct = await loadPaperAccount(env);
   let changed = false;
+  // 🆕 Always update, every tick — this is what proves to the UI the scan
+  // actually ran, instead of it being impossible to tell "not running" apart
+  // from "running but nothing qualified".
+  acct.lastScanAt = Date.now();
+  acct.lastDataOk = diag ? diag.successCount : null;
+  acct.lastTopSignal = diag ? diag.topSignal : null;
+  changed = true;
 
   // 1) Check existing open paper positions for SL/TP/liquidation at current price
   const stillOpen = [];

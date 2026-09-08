@@ -931,7 +931,18 @@ async function loadCloudPaperStatus(){
     const hist=acct.history||[];
     const wins=hist.filter(h=>h.pnl>0).length;
     document.getElementById('cpWinRate').textContent=hist.length?Math.round(wins/hist.length*100)+'%':'0%';
-    document.getElementById('cloudPaperStatus').textContent=`Scanning all 22 coins every ~3min — ${(acct.positions||[]).length} open, ${hist.length} closed so far`;
+    // 🆕 proof-of-life: last scan time + what it saw, so "is this even running?" has a direct answer here instead of needing a separate panel
+    let statusLine;
+    if(acct.lastScanAt){
+      const secsAgo=Math.round((Date.now()-acct.lastScanAt)/1000);
+      const ago=secsAgo<90?`${secsAgo}s ago`:`${Math.round(secsAgo/60)}m ago`;
+      const dataInfo=acct.lastDataOk!=null?`, data ok ${acct.lastDataOk}/22`:'';
+      const topInfo=acct.lastTopSignal?`, strongest seen: ${acct.lastTopSignal.symbol} ${acct.lastTopSignal.direction} ${acct.lastTopSignal.confidence}%`:'';
+      statusLine=`✅ Last scan ${ago}${dataInfo}${topInfo} — ${(acct.positions||[]).length} open, ${hist.length} closed so far`;
+    } else {
+      statusLine=`⚠️ No scan recorded yet — deploy may not have completed, or cron hasn't ticked yet`;
+    }
+    document.getElementById('cloudPaperStatus').textContent=statusLine;
     const histEl=document.getElementById('cloudPaperHistory');
     if(hist.length){
       histEl.innerHTML=hist.slice(0,8).map(h=>{
@@ -943,7 +954,7 @@ async function loadCloudPaperStatus(){
       histEl.innerHTML='<div>No closed trades yet.</div>';
     }
   }catch(e){
-    document.getElementById('cloudPaperStatus').textContent='Could not reach cloud paper bot';
+    document.getElementById('cloudPaperStatus').textContent='⚠️ Could not reach cloud paper bot backend at all — check the Worker URL / CORS / that it deployed';
   }
 }
 
