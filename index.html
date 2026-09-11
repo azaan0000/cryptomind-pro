@@ -1579,19 +1579,21 @@ function generateSignal(ind,symbol,candles,opts){
   const htfLong=htfTFs.filter(tf=>htfData[tf]==='LONG').length;
   const htfShort=htfTFs.filter(tf=>htfData[tf]==='SHORT').length;
   let htfVeto=false;
-  // 🛠️ TIGHTENED (backtest-informed, 2026-08-31): every strategy variant tested
-  // against real BTC data underperformed simple buy-and-hold, and the common
-  // thread was overtrading — too many marginal setups. This gate now requires
-  // ACTIVE majority agreement from the higher timeframes (2+ of the 3 must
-  // confirm the direction), not just "not opposed." Fewer trades, higher bar.
+  // 🛠️ REVERTED (2026-09-09): the 2026-08-31 tightening required 2+ HTFs to
+  // ACTIVELY agree, based on a daily-BTC backtest. In live 5-minute trading
+  // this combined with the SMC hard gate below to make the system trade
+  // almost never — days with zero trades despite the browser showing 90%+
+  // signals. That real-world result is stronger evidence than the limited
+  // backtest, so this is back to the original, looser rule: only veto if
+  // 2+ HTFs are ACTIVELY OPPOSED, don't require active agreement.
   if(applyGates&&direction!=='HOLD'&&htfTFs.length>=2){
-    if(direction==='LONG'&&htfLong<2){htfVeto=true;}
-    if(direction==='SHORT'&&htfShort<2){htfVeto=true;}
+    if(direction==='LONG'&&htfShort>=2){htfVeto=true;}
+    if(direction==='SHORT'&&htfLong>=2){htfVeto=true;}
   }
   if(htfLong>=2&&!htfVeto){reasons.push({t:'ok',txt:`✅ ${htfLong}/3 higher TFs bullish`});}
   if(htfShort>=2&&!htfVeto){reasons.push({t:'ok',txt:`✅ ${htfShort}/3 higher TFs bearish`});}
   if(htfVeto){
-    warnings.push({t:'warn',txt:`🚫 Blocked — needs 2+ higher timeframes actively confirming (have ${direction==='LONG'?htfLong:htfShort}/3)`});
+    warnings.push({t:'warn',txt:`🚫 Blocked — counter-trend vs higher timeframes (${direction==='LONG'?htfShort:htfLong}/3 disagree)`});
     direction='HOLD'; label='HOLD';
   }
 
@@ -2195,7 +2197,7 @@ function checkAutoTrade(sig){
 
   const lastDir=state.autoTradeLastDir[state.symbol];
   if(lastDir===sig.direction) return; // already traded this exact signal
-  if(sig.confidence<80) return; // 🛠️ TIGHTENED (backtest-informed, 2026-08-31): raised from 60 — matches the real bot's threshold now
+  if(sig.confidence<60) return; // 🛠️ REVERTED (2026-09-09): back to 60 — the 80% + strict HTF combo made the system essentially never trade in live conditions
 
   // 🛠️ FIX: the lastDir check above only blocks a REPEATED identical signal —
   // if the signal flickers even briefly (e.g. LONG→HOLD→LONG in a choppy
@@ -2848,7 +2850,7 @@ async function checkRealAutoTrade(sig,symbol,timeframe){
   checkDailyReset();
   if(Date.now()<state.botCooldownUntil) return;
   if(sig.direction==='HOLD'||!sig.entry) return;
-  if(sig.confidence<80) return; // 🛠️ TIGHTENED (backtest-informed, 2026-08-31): raised from 70 — every tested variant that traded more often did worse; fewer, stronger setups only
+  if(sig.confidence<70) return; // 🛠️ REVERTED (2026-09-09): back to 70 — the 80% + strict HTF combo made the system essentially never trade in live conditions
 
   const lastDir=realAutoLastDir[symbol];
   if(lastDir===sig.direction) return;

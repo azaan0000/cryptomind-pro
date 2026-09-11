@@ -924,15 +924,16 @@ function generateSignalW(ind, symbol, candles, htfData, deriv, applyGates){
   if(score>=THRESH) direction='LONG';
   else if(score<=-THRESH) direction='SHORT';
 
-  // Hard gate 1: HTF alignment — 🛠️ TIGHTENED (backtest-informed, 2026-08-31):
-  // now requires ACTIVE majority agreement (2+ of 1h/4h/1d confirming), not
-  // just "not opposed". Same reasoning as index.html's gate.
+  // Hard gate 1: HTF alignment — 🛠️ REVERTED (2026-09-09): back to "veto only
+  // if actively opposed" — the 2026-08-31 "must actively agree" tightening,
+  // combined with the SMC hard gate, made the live system trade almost
+  // never. Real-world result overrides the limited daily-BTC backtest.
   const htfTFs=['1h','4h','1d'].filter(tf=>htfData[tf]);
   const htfLong=htfTFs.filter(tf=>htfData[tf]==='LONG').length;
   const htfShort=htfTFs.filter(tf=>htfData[tf]==='SHORT').length;
   if(applyGates&&direction!=='HOLD'&&htfTFs.length>=2){
-    if(direction==='LONG'&&htfLong<2) direction='HOLD';
-    if(direction==='SHORT'&&htfShort<2) direction='HOLD';
+    if(direction==='LONG'&&htfShort>=2) direction='HOLD';
+    if(direction==='SHORT'&&htfLong>=2) direction='HOLD';
   }
 
   // Hard gate 2: SMC reaction zone must agree
@@ -1078,7 +1079,7 @@ async function runAutoTradeScan(env){
       if(!topSignal || sig.confidence>topSignal.confidence){
         topSignal = { symbol:coin.sym, direction:sig.direction, confidence:sig.confidence };
       }
-      if(sig.direction!=='HOLD' && sig.confidence>=80){ // 🛠️ TIGHTENED (backtest-informed, 2026-08-31): raised from 70
+      if(sig.direction!=='HOLD' && sig.confidence>=70){ // 🛠️ REVERTED (2026-09-09): back to 70
         candidates.push({ symbol:coin.sym, ...sig });
       }
     }catch(e){ /* one coin failing shouldn't stop the whole scan */ }
