@@ -727,6 +727,7 @@ const state = {
   ptBalance:10, ptOpen:[], ptHist:[],
   alerts:[], soundOn:true,
   mtfData:{}, // keyed per-symbol: {BTCUSDT:{1m:'LONG',4h:'HOLD'}}
+  signalSmooth:{}, signalDir:{}, // 🆕 per-symbol smoothed score + confirmed direction, for signal hysteresis (not persisted server-side — resets are fine, just means one candle of "getting reacquainted")
   autoTrade:false,
   autoTradeLastDir:{},
   realAutoTrade:false, riskAccepted:false, // 🛠️ FIX: these were never persisted before — toggle silently reset to OFF on every reload, so signals could show BUY/SELL with no trade actually firing
@@ -898,6 +899,25 @@ function ichimoku(candles){
 }
 
 const PAPER_FEE_RATE=0.0004; // 🆕 0.04% taker fee, matching real Binance USDT-M futures — charged on notional, both entry and exit, so paper results reflect what real trading would actually cost
+
+// 🆕 Tiered maintenance margin rate + slippage estimate + funding boundary — mirrors worker.js exactly, so client and cloud paper trading behave the same way
+const MMR_MAJORS=0.005, MMR_LARGE=0.01, MMR_SMALL=0.015;
+function getMMR(symbol){
+  if(symbol==='BTCUSDT'||symbol==='ETHUSDT') return MMR_MAJORS;
+  if(['BNBUSDT','SOLUSDT','XRPUSDT','ADAUSDT','DOGEUSDT','LINKUSDT','AVAXUSDT','LTCUSDT','TONUSDT','TRXUSDT'].includes(symbol)) return MMR_LARGE;
+  return MMR_SMALL;
+}
+function slippagePctFor(symbol){
+  if(symbol==='BTCUSDT'||symbol==='ETHUSDT') return 0.0002;
+  if(['BNBUSDT','SOLUSDT','XRPUSDT','ADAUSDT','DOGEUSDT','LINKUSDT','AVAXUSDT','LTCUSDT','TONUSDT','TRXUSDT'].includes(symbol)) return 0.0004;
+  return 0.0008;
+}
+function lastFundingBoundary(now){
+  const d=new Date(now);
+  const h=d.getUTCHours();
+  const bh=h>=16?16:(h>=8?8:0);
+  return Date.UTC(d.getUTCFullYear(),d.getUTCMonth(),d.getUTCDate(),bh,0,0,0);
+}
 
 function fmtPrice(p){
   if(!p||isNaN(p)) return '--';
@@ -1124,7 +1144,7 @@ function connectWS(symbol,tf){
 }
 
 /* ─── CHART ENGINE ──────────────────────────────────── */
-let mainChart,candleSeries,ema20Series,ema50Series,bbUpperSeries,bbLowerSeries,volChart,volSeries;
+let mainChart,candleSeries,ema20Series,ema50Series,bbUpperSeries,bbLowerSeries,volChart,volSeries,trendLineSeries;
 let supLine,resLine,entryLine,slLine,tp1Line,tp2Line;
 let chartInitialized=false;
 
@@ -1141,6 +1161,7 @@ function initCharts(){
   ema50Series=mainChart.addLineSeries({color:'#f5a623',lineWidth:1.5,priceLineVisible:false,title:'EMA50'});
   bbUpperSeries=mainChart.addLineSeries({color:'rgba(139,92,246,.4)',lineWidth:1,priceLineVisible:false});
   bbLowerSeries=mainChart.addLineSeries({color:'rgba(139,92,246,.4)',lineWidth:1,priceLineVisible:false});
+  trendLineSeries=mainChart.addLineSeries({color:'#f5a623',lineWidth:2,lineStyle:2,priceLineVisible:false,lastValueVisible:false,crosshairMarkerVisible:false}); // 🆕 dashed projected trendline, drawn like a person would mark it on the chart
 
   volChart=LightweightCharts.createChart(document.getElementById('chartVol'),{
     layout:{background:{color:'transparent'},textColor:'#5a6a8a'},
@@ -1157,6 +1178,44 @@ function initCharts(){
   chartInitialized=true;
 }
 
+/* 🆕 Trendline projection — finds the last two significant swing points
+   (swing lows for an uptrend, swing highs for a downtrend), connects them,
+   and extrapolates the same slope a few candles forward. This is the
+   "mark the line, project where price is headed" step a person does by
+   eye on a chart, made mechanical: draw the line through the swings that
+   are actually there, then extend it — not a prediction guarantee, just
+   the same visual read a trader would sketch. */
+function computeTrendLineProjection(candles){
+  if(!candles||candles.length<30) return null;
+  const recent=candles.slice(-60);
+  const smc=detectSMC(candles);
+  const bullish=smc.structBias==='bull';
+  const bearish=smc.structBias==='bear';
+  if(!bullish&&!bearish) return null; // ranging — no clear line to draw
+
+  let swings=[];
+  for(let i=2;i<recent.length-2;i++){
+    const c=recent[i];
+    if(bullish&&c.low<recent[i-1].low&&c.low<recent[i-2].low&&c.low<recent[i+1].low&&c.low<recent[i+2].low){
+      swings.push({time:c.time,value:c.low});
+    }
+    if(bearish&&c.high>recent[i-1].high&&c.high>recent[i-2].high&&c.high>recent[i+1].high&&c.high>recent[i+2].high){
+      swings.push({time:c.time,value:c.high});
+    }
+  }
+  if(swings.length<2) return null;
+  const p1=swings[swings.length-2], p2=swings[swings.length-1];
+  if(p2.time===p1.time) return null;
+  const slope=(p2.value-p1.value)/(p2.time-p1.time);
+  const barInterval=recent.length>1?(recent[recent.length-1].time-recent[recent.length-2].time):60;
+  const points=[p1,p2];
+  for(let k=1;k<=8;k++){
+    const t=p2.time+barInterval*k;
+    points.push({time:t,value:p2.value+slope*(t-p2.time)});
+  }
+  return points;
+}
+
 function renderChartFull(candles){
   if(!candles||candles.length<2) return;
 
@@ -1164,6 +1223,7 @@ function renderChartFull(candles){
   try{ candleSeries.setData([]); }catch(e){}
   try{ ema20Series.setData([]); }catch(e){}
   try{ ema50Series.setData([]); }catch(e){}
+  try{ trendLineSeries.setData([]); }catch(e){}
   try{ bbUpperSeries.setData([]); }catch(e){}
   try{ bbLowerSeries.setData([]); }catch(e){}
   try{ volSeries.setData([]); }catch(e){}
@@ -1193,6 +1253,14 @@ function renderChartFull(candles){
   const ind=computeIndicators(candles);
   if(ind&&ind.support>0) supLine=candleSeries.createPriceLine({price:ind.support,color:'rgba(0,229,160,.7)',lineWidth:1,lineStyle:2,axisLabelVisible:true,title:'Support'});
   if(ind&&ind.resistance>0) resLine=candleSeries.createPriceLine({price:ind.resistance,color:'rgba(255,64,96,.7)',lineWidth:1,lineStyle:2,axisLabelVisible:true,title:'Resistance'});
+
+  // 🆕 Trendline projection — marks the swing-line and its forward
+  // extension, like a trader sketching where the trend points next.
+  try{
+    const tl=computeTrendLineProjection(candles);
+    if(tl&&tl.length>2) trendLineSeries.setData(tl);
+    else trendLineSeries.setData([]);
+  }catch(e){ trendLineSeries.setData([]); }
 }
 
 function drawTradeLevels(sig){
@@ -1561,12 +1629,46 @@ function generateSignal(ind,symbol,candles,opts){
     reasons.push({t:'ok',txt:`✅ ADX ${ind.adx.toFixed(0)} — strong trend confirmed, high conviction`});
   }
 
-  /* ── TENTATIVE DECISION ── */
+  /* ── 🆕 SIGNAL STABILITY (2026-09-16): raw per-candle score was flipping
+     direction abruptly whenever a single new candle nudged it across the
+     threshold. This smooths the score across candles and uses hysteresis —
+     once a direction is established, it takes a genuine reversal (not just
+     a dip back toward zero) to let go of it. Only applied to the real,
+     user-facing signal calls (applyGates=true) — the internal gate:false
+     calls used just to read "what's the trend on this other timeframe"
+     don't get this treatment, both because they don't need stability and
+     because applying it there would key-collide across the 6 MTF panel
+     timeframes for the same symbol. Keyed by symbol+timeframe so a coin's
+     1h reading and its 5m reading track separately. ── */
   const THRESH=3.0;
   let label='HOLD',direction='HOLD';
-  if(score>=THRESH){ label='BUY'; direction='LONG'; }
-  else if(score<=-THRESH){ label='SELL'; direction='SHORT'; }
-  else { warnings.push({t:'warn',txt:`⏳ Score: ${score.toFixed(1)} (need ±${THRESH})`}); }
+  const tfKey=(opts&&opts.tf)?opts.tf:(applyGates?(symbol===state.symbol?state.tf:'5m'):null);
+  if(tfKey){
+    const HOLD_BAND=1.0;
+    if(!state.signalSmooth) state.signalSmooth={};
+    if(!state.signalDir) state.signalDir={};
+    const hKey=symbol+'_'+tfKey;
+    const prevSmooth=state.signalSmooth[hKey]!=null?state.signalSmooth[hKey]:score;
+    score=prevSmooth*0.6+score*0.4; // smoothed — replaces the raw single-candle score from here on
+    state.signalSmooth[hKey]=score;
+    const prevDir=state.signalDir[hKey]||'HOLD';
+    if(prevDir==='LONG'){
+      if(score>=-HOLD_BAND){ direction='LONG'; label='BUY'; }
+      else if(score<=-THRESH){ direction='SHORT'; label='SELL'; }
+    } else if(prevDir==='SHORT'){
+      if(score<=HOLD_BAND){ direction='SHORT'; label='SELL'; }
+      else if(score>=THRESH){ direction='LONG'; label='BUY'; }
+    } else {
+      if(score>=THRESH){ direction='LONG'; label='BUY'; }
+      else if(score<=-THRESH){ direction='SHORT'; label='SELL'; }
+    }
+    state.signalDir[hKey]=direction;
+  } else {
+    // internal gate:false helper call — no smoothing, just the raw threshold check
+    if(score>=THRESH){ direction='LONG'; label='BUY'; }
+    else if(score<=-THRESH){ direction='SHORT'; label='SELL'; }
+  }
+  if(direction==='HOLD') warnings.push({t:'warn',txt:`⏳ Score: ${score.toFixed(1)} (need ±${THRESH})`});
 
   /* ── 🚧 HARD GATE 1: HTF trend alignment — counter-trend entries are
      now BLOCKED outright (previously just a small bonus). If 2+ of the
@@ -1899,7 +2001,7 @@ async function scanOpportunities(){
       const smc=detectSMC(candles);
       const sc=computeTradeScore(ind,smc);
       await refreshDerivatives(coin.sym,candles);
-      const sig=generateSignal(ind,coin.sym,candles);
+      const sig=generateSignal(ind,coin.sym,candles,{tf:'5m'});
       sc.total=sig.confidence; // unify: gauge/opportunity score now always equals the actual trade-decision confidence, not a separately-weighted number
       scores.push({sym:coin.lbl,full:coin.sym,score:sc.total,direction:sig.direction,confidence:sig.confidence,price:ind.price});
       checkRealAutoTrade(sig,coin.sym,'5m'); // scan every watchlist coin for the real bot, not just the open chart — always 5m since scanOpportunities fetches 5m candles
@@ -2058,8 +2160,9 @@ function openTrade(){
   const tp=side==='long'?entry*(1+tpPct/100):entry*(1-tpPct/100);
 
   // 🛡️ LIQUIDATION PROTECTION: at leverage, a big enough move wipes the margin.
-  // Liquidation ≈ 90%/leverage adverse move (simplified, leaves 10% safety buffer).
-  const liqDistPct=90/leverage;
+  // 🆕 Tiered maintenance margin rate (matches real Binance varying by symbol
+  // risk tier) instead of a flat 90%/leverage guess.
+  const liqDistPct=(100/leverage)-getMMR(state.symbol)*100;
   const liqPrice=side==='long'?entry*(1-liqDistPct/100):entry*(1+liqDistPct/100);
   if(slPct>=liqDistPct){
     sl=liqPrice; // clip SL to liquidation — you'd be wiped out before SL triggers otherwise
@@ -2079,17 +2182,21 @@ function openTrade(){
   const entryFee=+(positionValue*PAPER_FEE_RATE).toFixed(4); // 🆕 real Binance charges this on entry too
   state.ptBalance=+(state.ptBalance-entryFee).toFixed(2);
 
+  const slip=slippagePctFor(state.symbol); // 🆕 real market-order fills aren't exactly at the signal price
+  const filledEntry=side==='long'?entry*(1+slip):entry*(1-slip);
+
   state.ptOpen.push({
     id:Date.now(),
     symbol:state.symbol,side,
     size:positionValue, // PnL calculated on full exposure, like real leveraged trading
     margin:size,leverage,liqPrice,timeframe:state.tf,
-    entry,sl,tp,
+    entry:filledEntry,sl,tp,
+    lastFundingAt:lastFundingBoundary(Date.now()),
     openedAt:new Date().toLocaleTimeString(),
     openedTs:Date.now(),
   });
   renderPT(); saveState();
-  showToast(`Opened ${side.toUpperCase()} ${state.symbol} @ ${fmtPrice(entry)} — ${leverage}x, $${size} margin`,'buy');
+  showToast(`Opened ${side.toUpperCase()} ${state.symbol} @ ${fmtPrice(filledEntry)} — ${leverage}x, $${size} margin`,'buy');
 }
 
 /* Runs every 5s for ALL open positions — not just current coin */
@@ -2113,6 +2220,20 @@ function checkAllPaperTrades(){
     if(!symPrice) return true;
     const isLong=t.side==='long';
     const margin=t.margin||t.size; // fallback for trades opened before leverage feature
+
+    // 🆕 Funding cost/credit — settles once per 8h boundary crossed while open, matching real futures
+    const fb=lastFundingBoundary(Date.now());
+    if(t.lastFundingAt==null) t.lastFundingAt=t.openedTs||Date.now();
+    if(fb>t.lastFundingAt){
+      const rate=(typeof derivCache!=='undefined'&&derivCache[t.symbol]&&typeof derivCache[t.symbol].fundingRate==='number')?derivCache[t.symbol].fundingRate/100:0;
+      if(rate!==0){
+        const payment=t.size*rate; // positive rate: longs pay shorts
+        const cost=isLong?-payment:payment;
+        state.ptBalance=+(state.ptBalance+cost).toFixed(4);
+        if(Math.abs(cost)>=0.0005) changed=true;
+      }
+      t.lastFundingAt=fb;
+    }
 
     /* ── PARTIAL TP: if trade has tp1/tp2, take 50% at tp1, move SL to breakeven ── */
     if(t.tp1&&t.tp2&&!t.scaledOut){
@@ -2232,17 +2353,20 @@ function checkAutoTrade(sig){
   state.ptBalance=+(state.ptBalance-BOT_MARGIN).toFixed(2); // reserve margin now — released back on close
   const botEntryFee=+(BOT_MARGIN*BOT_LEVERAGE*PAPER_FEE_RATE).toFixed(4); // 🆕 real entry fee
   state.ptBalance=+(state.ptBalance-botEntryFee).toFixed(2);
+  const slip=slippagePctFor(state.symbol); // 🆕 real market-order fill isn't exactly at the signal price
+  const filledEntry=side==='long'?sig.entry*(1+slip):sig.entry*(1-slip);
   state.ptOpen.push({
     id:Date.now()+Math.random(),
     symbol:state.symbol,side,
     size:BOT_MARGIN*BOT_LEVERAGE, // exposure = margin × leverage
     margin:BOT_MARGIN,leverage:BOT_LEVERAGE,timeframe:state.tf,
-    entry:sig.entry,sl:sig.sl,tp:sig.tp1,tp1:sig.tp1,tp2:sig.tp2,
+    entry:filledEntry,sl:sig.sl,tp:sig.tp1,tp1:sig.tp1,tp2:sig.tp2,
+    lastFundingAt:lastFundingBoundary(Date.now()),
     openedAt:new Date().toLocaleTimeString(),openedTs:Date.now(),
     isBot:true,
   });
   renderPT();saveState();
-  showToast(`🤖 Bot opened ${side.toUpperCase()} ${state.symbol} @ ${fmtPrice(sig.entry)} — 3x, ${sig.confidence}% conf`,side==='long'?'buy':'sell');
+  showToast(`🤖 Bot opened ${side.toUpperCase()} ${state.symbol} @ ${fmtPrice(filledEntry)} — 3x, ${sig.confidence}% conf`,side==='long'?'buy':'sell');
 }
 
 function renderBotStatus(){

@@ -878,7 +878,7 @@ function computeIndicatorsW(candles){
 // hard gates (HTF alignment + SMC reaction zone), same trade-plan
 // math. Difference: htfData/deriv/news are passed in as params
 // instead of read from browser globals, since this runs server-side.
-function generateSignalW(ind, symbol, candles, htfData, deriv, applyGates){
+function generateSignalW(ind, symbol, candles, htfData, deriv, applyGates, news, hyst){
   if(applyGates===undefined) applyGates=true; // 🛠️ FIX (2026-09-03): the inner per-timeframe calls used to compute htfData['1h']/['4h']/['1d'] were ALWAYS applying the HTF+SMC hard gates too — meaning a higher timeframe could basically never register as LONG/SHORT (SMC reaction-zone proximity is rare on any given check), so htfLong/htfShort stayed at 0 and the tightened "need 2+ HTFs to actively agree" gate vetoed EVERY signal, on every coin, every tick. That's why confidence could show 95% and still never open a trade. Scan loop below now passes applyGates=false for those inner calls, matching how the client computes them.
   if(!ind) return{direction:'HOLD',confidence:0};
   const p=ind.price;
@@ -916,13 +916,43 @@ function generateSignalW(ind, symbol, candles, htfData, deriv, applyGates){
   if(score>0&&ind.obvRising) score+=0.5;
   if(score<0&&!ind.obvRising) score-=0.5;
 
+  // 🆕 News sentiment — ±1, only when there's a clear lean and enough headlines (matches client)
+  if(news&&Math.abs(news.score)>=0.3&&(news.bullish+news.bearish)>=2){
+    if(news.score>0) score+=1; else score-=1;
+  }
+
   const weakTrend=ind.adx<20;
   if(weakTrend) score=score*0.5;
 
+  // 🆕 SIGNAL STABILITY (2026-09-16): same hysteresis as index.html's
+  // generateSignal — smooths the score across ticks and only lets go of an
+  // established direction on a genuine reversal, not a small dip. Only
+  // applied when applyGates is true (the real tradeable signal) and a hyst
+  // object is supplied; the internal HTF-reading sub-calls skip this.
   const THRESH=3.0;
   let direction='HOLD';
-  if(score>=THRESH) direction='LONG';
-  else if(score<=-THRESH) direction='SHORT';
+  let outSmooth=score, outDir='HOLD';
+  if(applyGates && hyst){
+    const HOLD_BAND=1.0;
+    const prevSmooth=hyst.smooth!=null?hyst.smooth:score;
+    score=prevSmooth*0.6+score*0.4;
+    outSmooth=score;
+    const prevDir=hyst.dir||'HOLD';
+    if(prevDir==='LONG'){
+      if(score>=-HOLD_BAND) direction='LONG';
+      else if(score<=-THRESH) direction='SHORT';
+    } else if(prevDir==='SHORT'){
+      if(score<=HOLD_BAND) direction='SHORT';
+      else if(score>=THRESH) direction='LONG';
+    } else {
+      if(score>=THRESH) direction='LONG';
+      else if(score<=-THRESH) direction='SHORT';
+    }
+    outDir=direction;
+  } else {
+    if(score>=THRESH) direction='LONG';
+    else if(score<=-THRESH) direction='SHORT';
+  }
 
   // Hard gate 1: HTF alignment — 🛠️ REVERTED (2026-09-09): back to "veto only
   // if actively opposed" — the 2026-08-31 "must actively agree" tightening,
@@ -957,7 +987,7 @@ function generateSignalW(ind, symbol, candles, htfData, deriv, applyGates){
     if(direction==='LONG'){sl=entry-slDist;tp1=entry+tp1Dist;tp2=entry+tp2Dist;}
     else{sl=entry+slDist;tp1=entry-tp1Dist;tp2=entry-tp2Dist;}
   }
-  return{direction,confidence,entry,sl,tp1,tp2};
+  return{direction,confidence,entry,sl,tp1,tp2,smooth:outSmooth,dir:outDir};
 }
 
 /* ── Candle fetchers — same exchange fallback order as the app (Binance → Bybit → OKX → Kucoin) ── */
@@ -1009,6 +1039,27 @@ async function fetchDerivativesW(symbol){
   return out;
 }
 
+// 🆕 News sentiment — ported from index.html's computeNewsSentiment, same
+// word lists, same scoring. Fetched ONCE per scan tick (market-wide signal,
+// not per-coin) and passed into every coin's generateSignalW call.
+const BULLISH_WORDS_W=['approval','approved','etf inflow','rally','surge','soar','adoption','partnership','upgrade','bullish','all-time high','record high','buy','inflows','breakthrough','integrat'];
+const BEARISH_WORDS_W=['hack','hacked','exploit','ban','banned','lawsuit','sec sues','crash','plunge','sell-off','selloff','bearish','outflow','delist','fraud','collapse','investigation','fine','penalty','breach','rug pull'];
+async function fetchNewsSentimentW(){
+  try{
+    const resp=await timedFetchW('https://min-api.cryptocompare.com/data/v2/news/?lang=EN',8000);
+    const data=await resp.json();
+    const articles=(data.Data||[]).slice(0,15);
+    let bull=0,bear=0;
+    for(const a of articles){
+      const t=(a.title||'').toLowerCase();
+      if(BULLISH_WORDS_W.some(w=>t.includes(w))) bull++;
+      if(BEARISH_WORDS_W.some(w=>t.includes(w))) bear++;
+    }
+    const total=bull+bear;
+    return { score: total>0?(bull-bear)/total:0, bullish:bull, bearish:bear };
+  }catch(e){ return { score:0, bullish:0, bearish:0 }; }
+}
+
 /* ── Bot config (synced from the browser whenever a toggle changes) ── */
 async function handleBotConfigSet(request, env, headers){
   const body = await request.json();
@@ -1049,8 +1100,20 @@ async function runAutoTradeScan(env){
   // what blew through Cloudflare's free-tier KV daily write quota before.
   const candidates = [];
   const latestPrices = {}; // 🆕 captured for every scanned coin, not just qualifying ones — feeds the paper simulator below without extra fetches
+  const fundingRates = {}; // 🆕 captured for funding-cost simulation on open paper positions
   let successCount = 0; // 🆕 diagnostic: how many coins actually got usable candle data this tick
   let topSignal = null; // 🆕 diagnostic: strongest signal seen this tick even if it didn't qualify — proves whether the engine is "seeing" strong setups
+  const newsSentiment = await fetchNewsSentimentW(); // 🆕 market-wide, fetched once, same for every coin this tick
+
+  // 🆕 SIGNAL STABILITY: load last tick's smoothed score/direction per symbol
+  // (single KV read), update in-memory as each coin resolves, single KV
+  // write at the end — cheap regardless of watchlist size.
+  let signalMemory = {};
+  try{
+    const raw = await env.ACCOUNTS_KV.get('signal_memory');
+    if(raw) signalMemory = JSON.parse(raw);
+  }catch(e){}
+
   await Promise.all(WATCHLIST.map(async (coin)=>{
     try{
       const [c5m,c1h,c4h,c1d] = await Promise.all([
@@ -1075,7 +1138,9 @@ async function runAutoTradeScan(env){
       const ind5m = computeIndicatorsW(c5m);
       if(!ind5m) return;
       const deriv = await fetchDerivativesW(coin.sym);
-      const sig = generateSignalW(ind5m, coin.sym, c5m, htfData, deriv);
+      fundingRates[coin.sym] = deriv.fundingRate;
+      const sig = generateSignalW(ind5m, coin.sym, c5m, htfData, deriv, true, newsSentiment, signalMemory[coin.sym]);
+      signalMemory[coin.sym] = { smooth: sig.smooth, dir: sig.dir }; // 🆕 persisted below for next tick's hysteresis
       if(!topSignal || sig.confidence>topSignal.confidence){
         topSignal = { symbol:coin.sym, direction:sig.direction, confidence:sig.confidence };
       }
@@ -1085,13 +1150,15 @@ async function runAutoTradeScan(env){
     }catch(e){ /* one coin failing shouldn't stop the whole scan */ }
   }));
 
+  try{ await env.ACCOUNTS_KV.put('signal_memory', JSON.stringify(signalMemory)); }catch(e){}
+
 
   // 🆕 Paper simulation ALWAYS runs, all 22 coins, every tick — regardless of
   // whether the real-money bot is on. This is what makes paper trading a
   // genuine always-on background test of the exact same engine that would
   // place real orders, instead of only reacting to whatever coin happens to
   // be on-screen in the browser.
-  await runPaperSim(env, candidates, latestPrices, { successCount, topSignal });
+  await runPaperSim(env, candidates, latestPrices, { successCount, topSignal }, fundingRates);
 
   if(!config.userId || !config.realAutoTrade || !config.riskAccepted) return; // real-money bot not enabled — paper sim above already ran, nothing more to do
 
@@ -1190,13 +1257,43 @@ const PAPER_FEE_RATE = 0.0004;
 const PAPER_START_BALANCE = 10;
 const PAPER_LEVERAGE = 3;
 
+// 🆕 Tiered maintenance margin rate, closer to how Binance actually varies
+// liquidation distance by symbol risk tier (majors need less buffer than
+// illiquid alts/memecoins).
+const MMR_MAJORS = 0.005;   // BTC, ETH — 0.5%
+const MMR_LARGE  = 0.01;    // BNB, SOL, XRP, ADA, DOGE, LINK, AVAX, LTC, TON, TRX — 1%
+const MMR_SMALL  = 0.015;   // everything else (SUI, PEPE, SHIB, APT, ARB, OP, INJ, WIF, JTO, JUP, GOLD) — 1.5%
+function getMMR(symbol){
+  if(symbol==='BTCUSDT'||symbol==='ETHUSDT') return MMR_MAJORS;
+  if(['BNBUSDT','SOLUSDT','XRPUSDT','ADAUSDT','DOGEUSDT','LINKUSDT','AVAXUSDT','LTCUSDT','TONUSDT','TRXUSDT'].includes(symbol)) return MMR_LARGE;
+  return MMR_SMALL;
+}
+function liqDistPctFor(symbol, leverage){
+  return (100/leverage) - getMMR(symbol)*100; // 🆕 real formula shape: 1/leverage minus maintenance margin, not a flat 90/leverage guess
+}
+// 🆕 Slippage estimate — majors fill closer to the signal price, illiquid
+// alts/memecoins slip more on market orders. Applied unfavorably.
+function slippagePctFor(symbol){
+  if(symbol==='BTCUSDT'||symbol==='ETHUSDT') return 0.0002; // 0.02%
+  if(['BNBUSDT','SOLUSDT','XRPUSDT','ADAUSDT','DOGEUSDT','LINKUSDT','AVAXUSDT','LTCUSDT','TONUSDT','TRXUSDT'].includes(symbol)) return 0.0004; // 0.04%
+  return 0.0008; // 0.08% — small caps/memecoins
+}
+// 🆕 Real futures funding settles at 00:00/08:00/16:00 UTC. Returns the
+// most recent boundary timestamp at or before `now`.
+function lastFundingBoundary(now){
+  const d = new Date(now);
+  const h = d.getUTCHours();
+  const boundaryHour = h>=16?16:(h>=8?8:0);
+  return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), boundaryHour, 0, 0, 0);
+}
+
 async function loadPaperAccount(env){
   const raw = await env.ACCOUNTS_KV.get('paper_account');
   if(!raw) return { balance: PAPER_START_BALANCE, positions: [], history: [] };
   try{ return JSON.parse(raw); }catch(e){ return { balance: PAPER_START_BALANCE, positions: [], history: [] }; }
 }
 
-async function runPaperSim(env, candidates, latestPrices, diag){
+async function runPaperSim(env, candidates, latestPrices, diag, fundingRates){
   const acct = await loadPaperAccount(env);
   let changed = false;
   // 🆕 Always update, every tick — this is what proves to the UI the scan
@@ -1207,6 +1304,8 @@ async function runPaperSim(env, candidates, latestPrices, diag){
   acct.lastTopSignal = diag ? diag.topSignal : null;
   changed = true;
 
+  const fundingBoundary = lastFundingBoundary(Date.now()); // 🆕 real futures settle funding at 00:00/08:00/16:00 UTC
+
   // 1) Check existing open paper positions for SL/TP/liquidation at current price
   const stillOpen = [];
   for(const p of acct.positions){
@@ -1214,6 +1313,19 @@ async function runPaperSim(env, candidates, latestPrices, diag){
     if(!price){ stillOpen.push(p); continue; } // no fresh price this tick — leave it, check next tick
     const isLong = p.side==='LONG';
     const margin = p.margin;
+
+    // 🆕 Funding cost/credit — settles once per 8h boundary crossed while the position is open, matching real futures
+    if(p.lastFundingAt==null) p.lastFundingAt = p.openedAt;
+    if(fundingBoundary > p.lastFundingAt){
+      const rate = fundingRates && typeof fundingRates[p.symbol]==='number' ? fundingRates[p.symbol]/100 : 0;
+      if(rate!==0){
+        const payment = p.size * rate; // positive rate: longs pay shorts
+        const cost = isLong ? -payment : payment;
+        acct.balance = +(acct.balance + cost).toFixed(4);
+        if(Math.abs(cost)>=0.0005) changed = true;
+      }
+      p.lastFundingAt = fundingBoundary;
+    }
 
     // Partial TP1 (once)
     if(p.tp1 && p.tp2 && !p.scaledOut){
@@ -1235,15 +1347,16 @@ async function runPaperSim(env, candidates, latestPrices, diag){
     const hitTP = isLong ? price>=tpLevel : price<=tpLevel;
     if(hitSL || hitTP){
       let reason = p.scaledOut ? 'Final TP2 Hit' : (hitTP ? 'TP Hit' : 'SL Hit');
+      const exitPrice = hitSL ? (isLong ? price*(1-slippagePctFor(p.symbol)) : price*(1+slippagePctFor(p.symbol))) : price; // 🆕 stop-loss slippage — market orders on a fast move don't always fill exactly at the trigger; TP behaves more like a limit fill so no slippage applied there
       let pnl = hitTP
         ? p.size*(Math.abs(tpLevel-p.entry)/p.entry)
-        : -(p.size*(Math.abs(slLevel-p.entry)/p.entry));
+        : -(p.size*(Math.abs(p.entry-exitPrice)/p.entry));
       const exitFee = p.size*PAPER_FEE_RATE;
       pnl -= exitFee;
       if(pnl < -p.margin){ pnl = -p.margin; reason = 'Liquidated'; }
       if(p.scaledOut && hitSL) reason = 'Breakeven Exit (risk-free)';
       acct.balance = +(acct.balance + pnl + p.margin).toFixed(4);
-      acct.history.unshift({ symbol:p.symbol, side:p.side, entry:p.entry, exit:price, pnl:+pnl.toFixed(4), reason, at: Date.now() });
+      acct.history.unshift({ symbol:p.symbol, side:p.side, entry:p.entry, exit:exitPrice, pnl:+pnl.toFixed(4), reason, at: Date.now() });
       changed = true;
       continue; // closed — don't push back to stillOpen
     }
@@ -1263,10 +1376,12 @@ async function runPaperSim(env, candidates, latestPrices, diag){
       const size = margin*PAPER_LEVERAGE;
       const entryFee = size*PAPER_FEE_RATE;
       if(margin+entryFee > acct.balance) continue;
+      const slip = slippagePctFor(c.symbol); // 🆕 entry slippage — real market-order fills aren't exactly at the signal price
+      const entryPrice = c.direction==='LONG' ? c.entry*(1+slip) : c.entry*(1-slip);
       acct.balance = +(acct.balance - margin - entryFee).toFixed(4);
       acct.positions.push({
-        symbol:c.symbol, side:c.direction, entry:c.entry, sl:c.sl, tp1:c.tp1, tp2:c.tp2,
-        margin, leverage:PAPER_LEVERAGE, size, scaledOut:false, confidence:c.confidence, openedAt: Date.now(),
+        symbol:c.symbol, side:c.direction, entry:entryPrice, sl:c.sl, tp1:c.tp1, tp2:c.tp2,
+        margin, leverage:PAPER_LEVERAGE, size, scaledOut:false, confidence:c.confidence, openedAt: Date.now(), lastFundingAt: fundingBoundary,
       });
       changed = true;
     }
