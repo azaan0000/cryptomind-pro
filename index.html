@@ -327,6 +327,7 @@ select:focus,.form-row input:focus,.form-row select:focus{outline:2px solid rgba
 </div>
 
 <div id="chartWrap">
+  <div id="chartPatternLabel" style="display:none;font-size:11px;font-weight:700;padding:4px 10px;background:var(--panel2);border-bottom:1px solid var(--border)"></div>
   <div id="chart"></div>
   <div id="chartVol"></div>
 </div>
@@ -1144,7 +1145,7 @@ function connectWS(symbol,tf){
 }
 
 /* ─── CHART ENGINE ──────────────────────────────────── */
-let mainChart,candleSeries,ema20Series,ema50Series,bbUpperSeries,bbLowerSeries,volChart,volSeries,trendLineSeries;
+let mainChart,candleSeries,ema20Series,ema50Series,bbUpperSeries,bbLowerSeries,volChart,volSeries,trendLineSeries,patternLine2Series;
 let supLine,resLine,entryLine,slLine,tp1Line,tp2Line;
 let chartInitialized=false;
 
@@ -1161,7 +1162,8 @@ function initCharts(){
   ema50Series=mainChart.addLineSeries({color:'#f5a623',lineWidth:1.5,priceLineVisible:false,title:'EMA50'});
   bbUpperSeries=mainChart.addLineSeries({color:'rgba(139,92,246,.4)',lineWidth:1,priceLineVisible:false});
   bbLowerSeries=mainChart.addLineSeries({color:'rgba(139,92,246,.4)',lineWidth:1,priceLineVisible:false});
-  trendLineSeries=mainChart.addLineSeries({color:'#f5a623',lineWidth:2,lineStyle:2,priceLineVisible:false,lastValueVisible:false,crosshairMarkerVisible:false}); // 🆕 dashed projected trendline, drawn like a person would mark it on the chart
+  trendLineSeries=mainChart.addLineSeries({color:'#f5a623',lineWidth:2,lineStyle:2,priceLineVisible:false,lastValueVisible:false,crosshairMarkerVisible:false}); // 🆕 primary pattern line (neckline, or upper boundary of a triangle/wedge)
+  patternLine2Series=mainChart.addLineSeries({color:'#f5a623',lineWidth:2,lineStyle:2,priceLineVisible:false,lastValueVisible:false,crosshairMarkerVisible:false}); // 🆕 second pattern line (lower boundary of a triangle/wedge) — unused for single-line patterns
 
   volChart=LightweightCharts.createChart(document.getElementById('chartVol'),{
     layout:{background:{color:'transparent'},textColor:'#5a6a8a'},
@@ -1185,36 +1187,164 @@ function initCharts(){
    eye on a chart, made mechanical: draw the line through the swings that
    are actually there, then extend it — not a prediction guarantee, just
    the same visual read a trader would sketch. */
-function computeTrendLineProjection(candles){
-  if(!candles||candles.length<30) return null;
-  const recent=candles.slice(-60);
-  const smc=detectSMC(candles);
-  const bullish=smc.structBias==='bull';
-  const bearish=smc.structBias==='bear';
-  if(!bullish&&!bearish) return null; // ranging — no clear line to draw
 
-  let swings=[];
-  for(let i=2;i<recent.length-2;i++){
-    const c=recent[i];
-    if(bullish&&c.low<recent[i-1].low&&c.low<recent[i-2].low&&c.low<recent[i+1].low&&c.low<recent[i+2].low){
-      swings.push({time:c.time,value:c.low});
+/* 🆕 Find swing highs/lows using the standard 2-bar-each-side fractal test. */
+function findSwings(candles){
+  const highs=[],lows=[];
+  for(let i=2;i<candles.length-2;i++){
+    const c=candles[i];
+    if(c.high>candles[i-1].high&&c.high>candles[i-2].high&&c.high>candles[i+1].high&&c.high>candles[i+2].high){
+      highs.push({time:c.time,value:c.high,idx:i});
     }
-    if(bearish&&c.high>recent[i-1].high&&c.high>recent[i-2].high&&c.high>recent[i+1].high&&c.high>recent[i+2].high){
-      swings.push({time:c.time,value:c.high});
+    if(c.low<candles[i-1].low&&c.low<candles[i-2].low&&c.low<candles[i+1].low&&c.low<candles[i+2].low){
+      lows.push({time:c.time,value:c.low,idx:i});
     }
   }
-  if(swings.length<2) return null;
-  const p1=swings[swings.length-2], p2=swings[swings.length-1];
-  if(p2.time===p1.time) return null;
-  const slope=(p2.value-p1.value)/(p2.time-p1.time);
-  const barInterval=recent.length>1?(recent[recent.length-1].time-recent[recent.length-2].time):60;
-  const points=[p1,p2];
-  for(let k=1;k<=8;k++){
-    const t=p2.time+barInterval*k;
-    points.push({time:t,value:p2.value+slope*(t-p2.time)});
-  }
-  return points;
+  return {highs,lows};
 }
+
+/* 🆕 Linear fit through a set of {time,value} points — returns slope+intercept
+   and a "touches" count (points within 0.3% of the fitted line, the same
+   idea as the "stronger trendline = more touches" read in the reference
+   image). Used for triangle/wedge/channel classification. */
+function fitLine(points){
+  if(points.length<2) return null;
+  const n=points.length;
+  const t0=points[0].time;
+  const xs=points.map(p=>p.time-t0), ys=points.map(p=>p.value);
+  const sx=xs.reduce((a,b)=>a+b,0), sy=ys.reduce((a,b)=>a+b,0);
+  const sxy=xs.reduce((a,x,i)=>a+x*ys[i],0), sxx=xs.reduce((a,x)=>a+x*x,0);
+  const denom=(n*sxx-sx*sx);
+  if(denom===0) return null;
+  const slope=(n*sxy-sx*sy)/denom;
+  const intercept=(sy-slope*sx)/n;
+  const valueAt=(time)=>intercept+slope*(time-t0);
+  const avgVal=sy/n;
+  const touches=points.filter(p=>Math.abs(p.value-valueAt(p.time))/avgVal<0.004).length;
+  return {slope,valueAt,touches,avgVal};
+}
+
+/* 🆕 Chart pattern recognition — Double Top/Bottom, Head & Shoulders (and
+   inverse), Triangles and Wedges, matching the classic shapes traders mark
+   by hand. Returns null when nothing clean is forming (a ranging chart with
+   no structure isn't forced into a pattern that isn't really there). */
+function detectChartPattern(candles){
+  if(!candles||candles.length<40) return null;
+  const recent=candles.slice(-100);
+  const {highs,lows}=findSwings(recent);
+  const lastPrice=recent[recent.length-1].close;
+  const barInterval=recent.length>1?(recent[recent.length-1].time-recent[recent.length-2].time):60;
+  const extendPts=(fn,fromT,n)=>{ const pts=[]; for(let k=0;k<=n;k++){ const t=fromT+barInterval*k; pts.push({time:t,value:fn(t)}); } return pts; };
+
+  // ── Double Top: last 2 swing highs within 1.5% of each other, with a swing low (neckline) between them ──
+  if(highs.length>=2){
+    const h1=highs[highs.length-2], h2=highs[highs.length-1];
+    if(Math.abs(h1.value-h2.value)/h1.value<0.015){
+      const between=lows.filter(l=>l.idx>h1.idx&&l.idx<h2.idx);
+      if(between.length){
+        const neck=between.reduce((a,b)=>a.value<b.value?a:b);
+        const height=((h1.value+h2.value)/2)-neck.value;
+        return {
+          name:'Double Top', bias:'bearish',
+          lines:[{points:[{time:h1.time,value:neck.value},...extendPts(()=>neck.value,h2.time,8)],label:'Neckline'}],
+          entry:neck.value, stop:h2.value, target:neck.value-height,
+          markerTime:recent[recent.length-1].time,
+        };
+      }
+    }
+  }
+  // ── Double Bottom: mirror ──
+  if(lows.length>=2){
+    const l1=lows[lows.length-2], l2=lows[lows.length-1];
+    if(Math.abs(l1.value-l2.value)/l1.value<0.015){
+      const between=highs.filter(h=>h.idx>l1.idx&&h.idx<l2.idx);
+      if(between.length){
+        const neck=between.reduce((a,b)=>a.value>b.value?a:b);
+        const height=neck.value-((l1.value+l2.value)/2);
+        return {
+          name:'Double Bottom', bias:'bullish',
+          lines:[{points:[{time:l1.time,value:neck.value},...extendPts(()=>neck.value,l2.time,8)],label:'Neckline'}],
+          entry:neck.value, stop:l2.value, target:neck.value+height,
+          markerTime:recent[recent.length-1].time,
+        };
+      }
+    }
+  }
+  // ── Head & Shoulders: last 3 swing highs, middle clearly the highest ──
+  if(highs.length>=3){
+    const [s1,head,s2]=highs.slice(-3);
+    if(head.value>s1.value*1.01&&head.value>s2.value*1.01&&Math.abs(s1.value-s2.value)/s1.value<0.03){
+      const necklineLows=lows.filter(l=>l.idx>s1.idx&&l.idx<s2.idx);
+      if(necklineLows.length>=2){
+        const nl1=necklineLows[0], nl2=necklineLows[necklineLows.length-1];
+        const fit=fitLine([nl1,nl2]);
+        if(fit){
+          const height=head.value-fit.valueAt(head.time);
+          return {
+            name:'Head & Shoulders', bias:'bearish',
+            lines:[{points:[nl1,...extendPts(fit.valueAt,nl2.time,8)],label:'Neckline'}],
+            entry:fit.valueAt(recent[recent.length-1].time), stop:s2.value, target:fit.valueAt(recent[recent.length-1].time)-height,
+            markerTime:recent[recent.length-1].time,
+          };
+        }
+      }
+    }
+  }
+  // ── Inverse Head & Shoulders: mirror ──
+  if(lows.length>=3){
+    const [s1,head,s2]=lows.slice(-3);
+    if(head.value<s1.value*0.99&&head.value<s2.value*0.99&&Math.abs(s1.value-s2.value)/s1.value<0.03){
+      const necklineHighs=highs.filter(h=>h.idx>s1.idx&&h.idx<s2.idx);
+      if(necklineHighs.length>=2){
+        const nh1=necklineHighs[0], nh2=necklineHighs[necklineHighs.length-1];
+        const fit=fitLine([nh1,nh2]);
+        if(fit){
+          const height=fit.valueAt(head.time)-head.value;
+          return {
+            name:'Inverse Head & Shoulders', bias:'bullish',
+            lines:[{points:[nh1,...extendPts(fit.valueAt,nh2.time,8)],label:'Neckline'}],
+            entry:fit.valueAt(recent[recent.length-1].time), stop:s2.value, target:fit.valueAt(recent[recent.length-1].time)+height,
+            markerTime:recent[recent.length-1].time,
+          };
+        }
+      }
+    }
+  }
+  // ── Triangle / Wedge / Channel fallback: fit both boundary lines from the last 3+ swings on each side ──
+  if(highs.length>=3&&lows.length>=3){
+    const hUse=highs.slice(-4), lUse=lows.slice(-4);
+    const upperFit=fitLine(hUse), lowerFit=fitLine(lUse);
+    if(upperFit&&lowerFit&&(upperFit.touches>=2||lowerFit.touches>=2)){
+      const lastT=recent[recent.length-1].time;
+      const upperSlopePct=upperFit.slope*barInterval/upperFit.avgVal;
+      const lowerSlopePct=lowerFit.slope*barInterval/lowerFit.avgVal;
+      const FLAT=0.0003; // roughly flat if the line moves <0.03% per bar
+      let name,bias;
+      if(Math.abs(upperSlopePct)<FLAT&&lowerSlopePct>FLAT){ name='Ascending Triangle'; bias='bullish'; }
+      else if(upperSlopePct<-FLAT&&Math.abs(lowerSlopePct)<FLAT){ name='Descending Triangle'; bias='bearish'; }
+      else if(upperSlopePct<-FLAT&&lowerSlopePct>FLAT){ name='Symmetrical Triangle'; bias='neutral'; }
+      else if(upperSlopePct>FLAT&&lowerSlopePct>FLAT&&upperSlopePct<lowerSlopePct){ name='Rising Wedge'; bias='bearish'; }
+      else if(upperSlopePct<-FLAT&&lowerSlopePct<-FLAT&&upperSlopePct>lowerSlopePct){ name='Falling Wedge'; bias='bullish'; }
+      else if(Math.abs(upperSlopePct-lowerSlopePct)<FLAT*2){ name='Channel'; bias=upperSlopePct>0?'bullish':upperSlopePct<0?'bearish':'neutral'; }
+      else return null; // lines diverging/inconsistent — no clean shape, don't force one
+
+      const firstT=Math.min(hUse[0].time,lUse[0].time);
+      const upperLine=[{time:firstT,value:upperFit.valueAt(firstT)},...extendPts(upperFit.valueAt,lastT,6)];
+      const lowerLine=[{time:firstT,value:lowerFit.valueAt(firstT)},...extendPts(lowerFit.valueAt,lastT,6)];
+      const height=upperFit.valueAt(lastT)-lowerFit.valueAt(lastT);
+      const entry=bias==='bearish'?lowerFit.valueAt(lastT):upperFit.valueAt(lastT);
+      return {
+        name:`${name} (${Math.max(upperFit.touches,lowerFit.touches)} touches)`, bias,
+        lines:[{points:upperLine,label:'Upper'},{points:lowerLine,label:'Lower'}],
+        entry, stop:bias==='bearish'?upperFit.valueAt(lastT):lowerFit.valueAt(lastT),
+        target:bias==='bearish'?entry-height:entry+height,
+        markerTime:lastT,
+      };
+    }
+  }
+  return null;
+}
+
 
 function renderChartFull(candles){
   if(!candles||candles.length<2) return;
@@ -1224,9 +1354,11 @@ function renderChartFull(candles){
   try{ ema20Series.setData([]); }catch(e){}
   try{ ema50Series.setData([]); }catch(e){}
   try{ trendLineSeries.setData([]); }catch(e){}
+  try{ patternLine2Series.setData([]); }catch(e){}
   try{ bbUpperSeries.setData([]); }catch(e){}
   try{ bbLowerSeries.setData([]); }catch(e){}
   try{ volSeries.setData([]); }catch(e){}
+  try{ candleSeries.setMarkers([]); }catch(e){}
 
   // Clear old price lines
   [supLine,resLine,entryLine,slLine,tp1Line,tp2Line].forEach(l=>{try{if(l)candleSeries.removePriceLine(l);}catch(e){}});
@@ -1254,13 +1386,38 @@ function renderChartFull(candles){
   if(ind&&ind.support>0) supLine=candleSeries.createPriceLine({price:ind.support,color:'rgba(0,229,160,.7)',lineWidth:1,lineStyle:2,axisLabelVisible:true,title:'Support'});
   if(ind&&ind.resistance>0) resLine=candleSeries.createPriceLine({price:ind.resistance,color:'rgba(255,64,96,.7)',lineWidth:1,lineStyle:2,axisLabelVisible:true,title:'Resistance'});
 
-  // 🆕 Trendline projection — marks the swing-line and its forward
-  // extension, like a trader sketching where the trend points next.
+  // 🆕 Chart pattern recognition — draws the actual pattern shape (neckline
+  // for Double Top/Bottom and Head & Shoulders, both boundaries for
+  // triangles/wedges), plus entry/stop/target markers, the way a trader
+  // would mark it up by hand. Left blank when nothing clean is forming.
+  const patternLabelEl=document.getElementById('chartPatternLabel');
   try{
-    const tl=computeTrendLineProjection(candles);
-    if(tl&&tl.length>2) trendLineSeries.setData(tl);
-    else trendLineSeries.setData([]);
-  }catch(e){ trendLineSeries.setData([]); }
+    const pat=detectChartPattern(candles);
+    if(pat){
+      trendLineSeries.setData(pat.lines[0].points);
+      patternLine2Series.setData(pat.lines[1]?pat.lines[1].points:[]);
+      const biasColor=pat.bias==='bullish'?'#00d68f':pat.bias==='bearish'?'#ff5470':'#f5a623';
+      const arrow=pat.bias==='bullish'?'▲':pat.bias==='bearish'?'▼':'◆';
+      candleSeries.setMarkers([
+        {time:pat.markerTime,position:'aboveBar',color:'#ff5470',shape:'circle',text:`Stop ${fmtPrice(pat.stop)}`},
+        {time:pat.markerTime,position:'inBar',color:'#f5a623',shape:'circle',text:`Entry ${fmtPrice(pat.entry)}`},
+        {time:pat.markerTime,position:'belowBar',color:'#00d68f',shape:'circle',text:`Target ${fmtPrice(pat.target)}`},
+      ]);
+      if(patternLabelEl){
+        patternLabelEl.style.display='block';
+        patternLabelEl.style.color=biasColor;
+        patternLabelEl.textContent=`${arrow} ${pat.name} — entry ${fmtPrice(pat.entry)}, stop ${fmtPrice(pat.stop)}, target ${fmtPrice(pat.target)}`;
+      }
+    } else {
+      trendLineSeries.setData([]);
+      patternLine2Series.setData([]);
+      if(patternLabelEl) patternLabelEl.style.display='none';
+    }
+  }catch(e){
+    trendLineSeries.setData([]);
+    patternLine2Series.setData([]);
+    if(patternLabelEl) patternLabelEl.style.display='none';
+  }
 }
 
 function drawTradeLevels(sig){
