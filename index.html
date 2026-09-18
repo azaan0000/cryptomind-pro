@@ -1146,7 +1146,7 @@ function connectWS(symbol,tf){
 
 /* ─── CHART ENGINE ──────────────────────────────────── */
 let mainChart,candleSeries,ema20Series,ema50Series,bbUpperSeries,bbLowerSeries,volChart,volSeries,trendLineSeries,patternLine2Series;
-let supLine,resLine,entryLine,slLine,tp1Line,tp2Line;
+let supLine,resLine,entryLine,slLine,tp1Line,tp2Line,patEntryLine,patStopLine,patTargetLine;
 let chartInitialized=false;
 
 function initCharts(){
@@ -1162,8 +1162,8 @@ function initCharts(){
   ema50Series=mainChart.addLineSeries({color:'#f5a623',lineWidth:1.5,priceLineVisible:false,title:'EMA50'});
   bbUpperSeries=mainChart.addLineSeries({color:'rgba(139,92,246,.4)',lineWidth:1,priceLineVisible:false});
   bbLowerSeries=mainChart.addLineSeries({color:'rgba(139,92,246,.4)',lineWidth:1,priceLineVisible:false});
-  trendLineSeries=mainChart.addLineSeries({color:'#f5a623',lineWidth:2,lineStyle:2,priceLineVisible:false,lastValueVisible:false,crosshairMarkerVisible:false}); // 🆕 primary pattern line (neckline, or upper boundary of a triangle/wedge)
-  patternLine2Series=mainChart.addLineSeries({color:'#f5a623',lineWidth:2,lineStyle:2,priceLineVisible:false,lastValueVisible:false,crosshairMarkerVisible:false}); // 🆕 second pattern line (lower boundary of a triangle/wedge) — unused for single-line patterns
+  trendLineSeries=mainChart.addLineSeries({color:'#ffffff',lineWidth:2,lineStyle:2,priceLineVisible:false,lastValueVisible:false,crosshairMarkerVisible:false}); // 🆕 primary pattern line (neckline, or upper boundary) — bright white so it doesn't blend with the orange/red S-R lines
+  patternLine2Series=mainChart.addLineSeries({color:'#c084fc',lineWidth:2,lineStyle:2,priceLineVisible:false,lastValueVisible:false,crosshairMarkerVisible:false}); // 🆕 second pattern line (lower boundary of a triangle/wedge) — distinct purple
 
   volChart=LightweightCharts.createChart(document.getElementById('chartVol'),{
     layout:{background:{color:'transparent'},textColor:'#5a6a8a'},
@@ -1236,56 +1236,73 @@ function detectChartPattern(candles){
   const barInterval=recent.length>1?(recent[recent.length-1].time-recent[recent.length-2].time):60;
   const extendPts=(fn,fromT,n)=>{ const pts=[]; for(let k=0;k<=n;k++){ const t=fromT+barInterval*k; pts.push({time:t,value:fn(t)}); } return pts; };
 
+  // 🛠️ Quality check (2026-09-19): rejects patterns built from tiny, adjacent
+  // noise-level swings instead of a real structure — this is what was
+  // producing a "Double Top" with a target on the wrong side of entry.
+  // A pattern must have its two defining points genuinely separated in
+  // time, and a neckline/height that's a meaningful move, not a few ticks.
+  const MIN_BAR_GAP=8;
+  const validate=(pat,price)=>{
+    if(!pat) return null;
+    const heightOk=Math.abs(pat.entry-pat.target)/price>=0.003; // at least ~0.3% move implied
+    const orderOk=pat.bias==='bearish'?(pat.target<pat.entry&&pat.entry<pat.stop):pat.bias==='bullish'?(pat.target>pat.entry&&pat.entry>pat.stop):true;
+    return (heightOk&&orderOk)?pat:null;
+  };
+
   // ── Double Top: last 2 swing highs within 1.5% of each other, with a swing low (neckline) between them ──
   if(highs.length>=2){
     const h1=highs[highs.length-2], h2=highs[highs.length-1];
-    if(Math.abs(h1.value-h2.value)/h1.value<0.015){
+    if(h2.idx-h1.idx>=MIN_BAR_GAP&&Math.abs(h1.value-h2.value)/h1.value<0.015){
       const between=lows.filter(l=>l.idx>h1.idx&&l.idx<h2.idx);
       if(between.length){
         const neck=between.reduce((a,b)=>a.value<b.value?a:b);
         const height=((h1.value+h2.value)/2)-neck.value;
-        return {
+        const pat=validate({
           name:'Double Top', bias:'bearish',
-          lines:[{points:[{time:h1.time,value:neck.value},...extendPts(()=>neck.value,h2.time,8)],label:'Neckline'}],
+          lines:[{points:[{time:neck.time,value:neck.value},...extendPts(()=>neck.value,h2.time,8)],label:'Neckline'}],
           entry:neck.value, stop:h2.value, target:neck.value-height,
           markerTime:recent[recent.length-1].time,
-        };
+        },lastPrice);
+        if(pat) return pat;
       }
     }
   }
   // ── Double Bottom: mirror ──
   if(lows.length>=2){
     const l1=lows[lows.length-2], l2=lows[lows.length-1];
-    if(Math.abs(l1.value-l2.value)/l1.value<0.015){
+    if(l2.idx-l1.idx>=MIN_BAR_GAP&&Math.abs(l1.value-l2.value)/l1.value<0.015){
       const between=highs.filter(h=>h.idx>l1.idx&&h.idx<l2.idx);
       if(between.length){
         const neck=between.reduce((a,b)=>a.value>b.value?a:b);
         const height=neck.value-((l1.value+l2.value)/2);
-        return {
+        const pat=validate({
           name:'Double Bottom', bias:'bullish',
-          lines:[{points:[{time:l1.time,value:neck.value},...extendPts(()=>neck.value,l2.time,8)],label:'Neckline'}],
+          lines:[{points:[{time:neck.time,value:neck.value},...extendPts(()=>neck.value,l2.time,8)],label:'Neckline'}],
           entry:neck.value, stop:l2.value, target:neck.value+height,
           markerTime:recent[recent.length-1].time,
-        };
+        },lastPrice);
+        if(pat) return pat;
       }
     }
   }
   // ── Head & Shoulders: last 3 swing highs, middle clearly the highest ──
   if(highs.length>=3){
     const [s1,head,s2]=highs.slice(-3);
-    if(head.value>s1.value*1.01&&head.value>s2.value*1.01&&Math.abs(s1.value-s2.value)/s1.value<0.03){
+    if(head.idx-s1.idx>=MIN_BAR_GAP&&s2.idx-head.idx>=MIN_BAR_GAP&&head.value>s1.value*1.01&&head.value>s2.value*1.01&&Math.abs(s1.value-s2.value)/s1.value<0.03){
       const necklineLows=lows.filter(l=>l.idx>s1.idx&&l.idx<s2.idx);
       if(necklineLows.length>=2){
         const nl1=necklineLows[0], nl2=necklineLows[necklineLows.length-1];
         const fit=fitLine([nl1,nl2]);
         if(fit){
           const height=head.value-fit.valueAt(head.time);
-          return {
+          const entryAt=fit.valueAt(recent[recent.length-1].time);
+          const pat=validate({
             name:'Head & Shoulders', bias:'bearish',
             lines:[{points:[nl1,...extendPts(fit.valueAt,nl2.time,8)],label:'Neckline'}],
-            entry:fit.valueAt(recent[recent.length-1].time), stop:s2.value, target:fit.valueAt(recent[recent.length-1].time)-height,
+            entry:entryAt, stop:s2.value, target:entryAt-height,
             markerTime:recent[recent.length-1].time,
-          };
+          },lastPrice);
+          if(pat) return pat;
         }
       }
     }
@@ -1293,19 +1310,21 @@ function detectChartPattern(candles){
   // ── Inverse Head & Shoulders: mirror ──
   if(lows.length>=3){
     const [s1,head,s2]=lows.slice(-3);
-    if(head.value<s1.value*0.99&&head.value<s2.value*0.99&&Math.abs(s1.value-s2.value)/s1.value<0.03){
+    if(head.idx-s1.idx>=MIN_BAR_GAP&&s2.idx-head.idx>=MIN_BAR_GAP&&head.value<s1.value*0.99&&head.value<s2.value*0.99&&Math.abs(s1.value-s2.value)/s1.value<0.03){
       const necklineHighs=highs.filter(h=>h.idx>s1.idx&&h.idx<s2.idx);
       if(necklineHighs.length>=2){
         const nh1=necklineHighs[0], nh2=necklineHighs[necklineHighs.length-1];
         const fit=fitLine([nh1,nh2]);
         if(fit){
           const height=fit.valueAt(head.time)-head.value;
-          return {
+          const entryAt=fit.valueAt(recent[recent.length-1].time);
+          const pat=validate({
             name:'Inverse Head & Shoulders', bias:'bullish',
             lines:[{points:[nh1,...extendPts(fit.valueAt,nh2.time,8)],label:'Neckline'}],
-            entry:fit.valueAt(recent[recent.length-1].time), stop:s2.value, target:fit.valueAt(recent[recent.length-1].time)+height,
+            entry:entryAt, stop:s2.value, target:entryAt+height,
             markerTime:recent[recent.length-1].time,
-          };
+          },lastPrice);
+          if(pat) return pat;
         }
       }
     }
@@ -1314,7 +1333,8 @@ function detectChartPattern(candles){
   if(highs.length>=3&&lows.length>=3){
     const hUse=highs.slice(-4), lUse=lows.slice(-4);
     const upperFit=fitLine(hUse), lowerFit=fitLine(lUse);
-    if(upperFit&&lowerFit&&(upperFit.touches>=2||lowerFit.touches>=2)){
+    const spanOk=(hUse[hUse.length-1].idx-hUse[0].idx>=MIN_BAR_GAP)&&(lUse[lUse.length-1].idx-lUse[0].idx>=MIN_BAR_GAP);
+    if(upperFit&&lowerFit&&spanOk&&(upperFit.touches>=2||lowerFit.touches>=2)){
       const lastT=recent[recent.length-1].time;
       const upperSlopePct=upperFit.slope*barInterval/upperFit.avgVal;
       const lowerSlopePct=lowerFit.slope*barInterval/lowerFit.avgVal;
@@ -1333,13 +1353,14 @@ function detectChartPattern(candles){
       const lowerLine=[{time:firstT,value:lowerFit.valueAt(firstT)},...extendPts(lowerFit.valueAt,lastT,6)];
       const height=upperFit.valueAt(lastT)-lowerFit.valueAt(lastT);
       const entry=bias==='bearish'?lowerFit.valueAt(lastT):upperFit.valueAt(lastT);
-      return {
+      const pat=validate({
         name:`${name} (${Math.max(upperFit.touches,lowerFit.touches)} touches)`, bias,
         lines:[{points:upperLine,label:'Upper'},{points:lowerLine,label:'Lower'}],
         entry, stop:bias==='bearish'?upperFit.valueAt(lastT):lowerFit.valueAt(lastT),
         target:bias==='bearish'?entry-height:entry+height,
         markerTime:lastT,
-      };
+      },lastPrice);
+      if(pat) return pat;
     }
   }
   return null;
@@ -1361,8 +1382,8 @@ function renderChartFull(candles){
   try{ candleSeries.setMarkers([]); }catch(e){}
 
   // Clear old price lines
-  [supLine,resLine,entryLine,slLine,tp1Line,tp2Line].forEach(l=>{try{if(l)candleSeries.removePriceLine(l);}catch(e){}});
-  supLine=resLine=entryLine=slLine=tp1Line=tp2Line=null;
+  [supLine,resLine,entryLine,slLine,tp1Line,tp2Line,patEntryLine,patStopLine,patTargetLine].forEach(l=>{try{if(l)candleSeries.removePriceLine(l);}catch(e){}});
+  supLine=resLine=entryLine=slLine=tp1Line=tp2Line=patEntryLine=patStopLine=patTargetLine=null;
 
   // Reset price scale to this coin's range
   mainChart.applyOptions({rightPriceScale:{autoScale:true,scaleMargins:{top:0.1,bottom:0.1}}});
@@ -1398,11 +1419,13 @@ function renderChartFull(candles){
       patternLine2Series.setData(pat.lines[1]?pat.lines[1].points:[]);
       const biasColor=pat.bias==='bullish'?'#00d68f':pat.bias==='bearish'?'#ff5470':'#f5a623';
       const arrow=pat.bias==='bullish'?'▲':pat.bias==='bearish'?'▼':'◆';
-      candleSeries.setMarkers([
-        {time:pat.markerTime,position:'aboveBar',color:'#ff5470',shape:'circle',text:`Stop ${fmtPrice(pat.stop)}`},
-        {time:pat.markerTime,position:'inBar',color:'#f5a623',shape:'circle',text:`Entry ${fmtPrice(pat.entry)}`},
-        {time:pat.markerTime,position:'belowBar',color:'#00d68f',shape:'circle',text:`Target ${fmtPrice(pat.target)}`},
-      ]);
+      // 🛠️ FIX (2026-09-19): price-lines instead of candle markers — markers
+      // at the same time/x-position were stacking on top of each other and
+      // becoming illegible. Price-lines put each label cleanly on the right
+      // axis, same as the existing Support/Resistance lines.
+      patEntryLine=candleSeries.createPriceLine({price:pat.entry,color:'#ffffff',lineWidth:1,lineStyle:0,axisLabelVisible:true,title:'Entry'});
+      patStopLine=candleSeries.createPriceLine({price:pat.stop,color:'#ff5470',lineWidth:1,lineStyle:0,axisLabelVisible:true,title:'Stop'});
+      patTargetLine=candleSeries.createPriceLine({price:pat.target,color:'#00d68f',lineWidth:1,lineStyle:0,axisLabelVisible:true,title:'Target'});
       if(patternLabelEl){
         patternLabelEl.style.display='block';
         patternLabelEl.style.color=biasColor;
