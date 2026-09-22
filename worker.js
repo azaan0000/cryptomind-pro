@@ -994,6 +994,7 @@ function generateSignalW(ind, symbol, candles, htfData, deriv, applyGates, news,
 async function fetchBinanceCandlesW(symbol,tf,limit=200){
   const url=`https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${TF_BINANCE[tf]}&limit=${limit}`;
   const r=await timedFetchW(url,8000);
+  if(!r.ok) throw new Error('HTTP '+r.status);
   const d=await r.json();
   if(!Array.isArray(d)||d.length<20) throw new Error('bad data');
   return d.map(c=>({time:Math.floor(c[0]/1000),open:+c[1],high:+c[2],low:+c[3],close:+c[4],volume:+c[5],takerBuyVolume:+c[9]}));
@@ -1001,6 +1002,7 @@ async function fetchBinanceCandlesW(symbol,tf,limit=200){
 async function fetchBybitCandlesW(symbol,tf,limit=200){
   const url=`https://api.bybit.com/v5/market/kline?category=spot&symbol=${symbol}&interval=${TF_BYBIT[tf]}&limit=${limit}`;
   const r=await timedFetchW(url,8000);
+  if(!r.ok) throw new Error('HTTP '+r.status);
   const d=await r.json();
   const list=[...d.result.list].reverse();
   if(list.length<20) throw new Error('bad');
@@ -1010,6 +1012,7 @@ async function fetchOkxCandlesW(symbol,tf,limit=200){
   const inst=symbol.slice(0,-4)+'-USDT';
   const url=`https://www.okx.com/api/v5/market/candles?instId=${inst}&bar=${TF_OKX[tf]}&limit=${limit}`;
   const r=await timedFetchW(url,8000);
+  if(!r.ok) throw new Error('HTTP '+r.status);
   const d=await r.json();
   const list=[...d.data].reverse();
   if(list.length<20) throw new Error('bad');
@@ -1019,15 +1022,19 @@ async function fetchKucoinCandlesW(symbol,tf,limit=200){
   const sym=symbol.slice(0,-4)+'-USDT';
   const url=`https://api.kucoin.com/api/v1/market/candles?type=${TF_KUCOIN[tf]}&symbol=${sym}`;
   const r=await timedFetchW(url,8000);
+  if(!r.ok) throw new Error('HTTP '+r.status);
   const d=await r.json();
   const list=[...d.data].reverse();
   if(list.length<20) throw new Error('bad');
   return list.map(c=>({time:+c[0],open:+c[1],close:+c[2],high:+c[3],low:+c[4],volume:+c[5]}));
 }
 async function fetchCandlesW(symbol,tf){
-  for(const fn of [fetchBinanceCandlesW,fetchBybitCandlesW,fetchOkxCandlesW,fetchKucoinCandlesW]){
-    try{ return await fn(symbol,tf); }catch(e){ /* try next exchange */ }
+  const errs=[];
+  for(const [name,fn] of [['binance',fetchBinanceCandlesW],['bybit',fetchBybitCandlesW],['okx',fetchOkxCandlesW],['kucoin',fetchKucoinCandlesW]]){
+    try{ return await fn(symbol,tf); }
+    catch(e){ errs.push(`${name}:${e&&e.message?e.message:String(e)}`); }
   }
+  fetchCandlesW.lastError = errs.join(' | '); // 🆕 surfaced in the scan diagnostics so failures are no longer silent
   return null;
 }
 async function fetchDerivativesW(symbol){
@@ -1163,7 +1170,7 @@ async function runAutoTradeScan(env){
   if(!config.userId || !config.realAutoTrade || !config.riskAccepted) return; // real-money bot not enabled — paper sim above already ran, nothing more to do
 
   if(candidates.length===0){
-    await appendBotLog(env,{ scanned:WATCHLIST.length, dataOk:successCount, qualifying:0, opened:0, top:topSignal }); // 🆕 dataOk shows how many of 22 coins actually returned usable candle data; top shows the strongest signal seen even if it didn't qualify — makes future discrepancies visible instead of silent
+    await appendBotLog(env,{ scanned:WATCHLIST.length, dataOk:successCount, qualifying:0, opened:0, top:topSignal, lastFetchErr:successCount===0?fetchCandlesW.lastError:undefined }); // 🆕 dataOk shows how many coins returned usable candle data; lastFetchErr reveals WHY when it's zero (was previously silent)
     return;
   }
 
