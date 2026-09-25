@@ -1030,7 +1030,12 @@ async function fetchKucoinCandlesW(symbol,tf,limit=200){
 }
 async function fetchCandlesW(symbol,tf){
   const errs=[];
-  for(const [name,fn] of [['binance',fetchBinanceCandlesW],['bybit',fetchBybitCandlesW],['okx',fetchOkxCandlesW],['kucoin',fetchKucoinCandlesW]]){
+  // 🛠️ FIX (2026-09-23): Binance confirmed (via live error log) to always
+  // return HTTP 451 from Cloudflare's IPs — a hard geo-block that won't
+  // change. Trying it first wasted one subrequest per coin per tick for no
+  // chance of success; skipped here to save that budget for exchanges that
+  // actually work.
+  for(const [name,fn] of [['bybit',fetchBybitCandlesW],['okx',fetchOkxCandlesW],['kucoin',fetchKucoinCandlesW]]){
     try{ return await fn(symbol,tf); }
     catch(e){ errs.push(`${name}:${e&&e.message?e.message:String(e)}`); }
   }
@@ -1105,6 +1110,23 @@ async function runAutoTradeScan(env){
   // relay round-trip costs several KV writes (job queue + phone "sent" ack +
   // phone "done" result), so doing this unconditionally on every tick is
   // what blew through Cloudflare's free-tier KV daily write quota before.
+  // 🛠️ CRITICAL FIX (2026-09-23): confirmed via live log evidence — scanning
+  // all 23 coins × 4 timeframes + funding rate = 100+ outbound requests in a
+  // single scan, but Cloudflare's free Workers plan caps a single invocation
+  // at 50 subrequests. Everything past that limit was being hard-rejected by
+  // the platform itself ("Too many subrequests by single Worker invocation"),
+  // which is the real reason data ok was 0/23 for so long — it wasn't a
+  // gating bug or an exchange block. Fix: rotate through the watchlist in
+  // groups instead of scanning everyone every tick. At ~6 coins/group × 5
+  // requests each + 1 news fetch ≈ 31 subrequests, safely under the limit.
+  // Cron runs every 3 min, so all 23 coins still get refreshed within ~12-15
+  // minutes — slower than before, but before wasn't actually working at all.
+  const GROUP_SIZE = 4; // kept conservative — even if some coins need 2-3 exchange fallback attempts per timeframe, 4 coins × ~5 requests × up to 2x retry + 1 news stays safely under the 50-subrequest limit
+  const numGroups = Math.ceil(WATCHLIST.length / GROUP_SIZE);
+  const tickIndex = Math.floor(Date.now() / (3*60*1000));
+  const groupIdx = tickIndex % numGroups;
+  const scanGroup = WATCHLIST.slice(groupIdx*GROUP_SIZE, groupIdx*GROUP_SIZE+GROUP_SIZE);
+
   const candidates = [];
   const latestPrices = {}; // 🆕 captured for every scanned coin, not just qualifying ones — feeds the paper simulator below without extra fetches
   const fundingRates = {}; // 🆕 captured for funding-cost simulation on open paper positions
@@ -1121,7 +1143,7 @@ async function runAutoTradeScan(env){
     if(raw) signalMemory = JSON.parse(raw);
   }catch(e){}
 
-  await Promise.all(WATCHLIST.map(async (coin)=>{
+  await Promise.all(scanGroup.map(async (coin)=>{
     try{
       const [c5m,c1h,c4h,c1d] = await Promise.all([
         fetchCandlesW(coin.sym,'5m'),
@@ -1170,7 +1192,7 @@ async function runAutoTradeScan(env){
   if(!config.userId || !config.realAutoTrade || !config.riskAccepted) return; // real-money bot not enabled — paper sim above already ran, nothing more to do
 
   if(candidates.length===0){
-    await appendBotLog(env,{ scanned:WATCHLIST.length, dataOk:successCount, qualifying:0, opened:0, top:topSignal, lastFetchErr:successCount===0?fetchCandlesW.lastError:undefined }); // 🆕 dataOk shows how many coins returned usable candle data; lastFetchErr reveals WHY when it's zero (was previously silent)
+    await appendBotLog(env,{ scanned:scanGroup.length, group:`${groupIdx+1}/${numGroups}`, dataOk:successCount, qualifying:0, opened:0, top:topSignal, lastFetchErr:successCount===0?fetchCandlesW.lastError:undefined }); // 🆕 dataOk shows how many of this tick's group returned usable data; group shows which rotation slice this was; lastFetchErr reveals WHY when it's zero
     return;
   }
 
@@ -1205,7 +1227,7 @@ async function runAutoTradeScan(env){
     if(margin<1){ await appendBotLog(env,{ skipped:'available balance too low to size a trade', qualifying:candidates.length }); return; }
   }
 
-  const scanList = WATCHLIST.filter(c=>!openSymbols.has(c.sym));
+  const scanList = scanGroup.filter(c=>!openSymbols.has(c.sym));
   const filteredCandidates = candidates.filter(c=>scanList.some(s=>s.sym===c.symbol));
 
   filteredCandidates.sort((a,b)=>b.confidence-a.confidence);

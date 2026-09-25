@@ -998,9 +998,10 @@ async function loadCloudScanStatus(){
         if(e.error) return `<div style="color:var(--red)">${t} — error: ${e.error}</div>`;
         const trades=(e.trades||[]).map(tr=>`${tr.symbol} ${tr.side}${tr.shadowOnly?' (shadow)':tr.ok?' ✅':' ❌'}`).join(', ');
         const dataInfo=e.dataOk!=null?` (data ok: ${e.dataOk}/${e.scanned})`:'';
+        const groupInfo=e.group?` [group ${e.group}]`:'';
         const topInfo=e.top?` | strongest seen: ${e.top.symbol} ${e.top.direction} ${e.top.confidence}%`:'';
         const errInfo=e.lastFetchErr?` <span style="color:var(--red)">— fetch failing: ${e.lastFetchErr}</span>`:'';
-        return `<div>${t} — scanned ${e.scanned}${dataInfo}, qualifying ${e.qualifying}${trades?': '+trades:''}${topInfo}${errInfo}</div>`;
+        return `<div>${t} — scanned ${e.scanned}${groupInfo}${dataInfo}, qualifying ${e.qualifying}${trades?': '+trades:''}${topInfo}${errInfo}</div>`;
       }).join('');
     } else {
       logEl.innerHTML='<div>No scans logged yet.</div>';
