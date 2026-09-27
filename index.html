@@ -452,8 +452,12 @@ select:focus,.form-row input:focus,.form-row select:focus{outline:2px solid rgba
       <div class="pt-stat"><div class="pt-stat-val" id="cpWinRate">0%</div><div class="pt-stat-lbl">Win Rate</div></div>
       <div class="pt-stat"><div class="pt-stat-val" id="cpOpenCount">0</div><div class="pt-stat-lbl">Open</div></div>
     </div>
-    <div id="cloudPaperHistory" style="font-size:10px;color:var(--sub);margin-top:8px;max-height:120px;overflow-y:auto"></div>
-    <div style="font-size:9px;color:var(--sub);margin-top:6px">This runs the SAME signal engine as real trading, scanning all 22 coins on Cloudflare's servers every ~3min — testing whether it would actually make money before you commit real capital. Starts at $10 to match a real deposit.</div>
+    <div style="font-size:10.5px;font-weight:600;margin-top:8px">Open positions:</div>
+    <div id="cloudPaperPositions" style="font-size:10px;color:var(--sub);margin-top:2px"></div>
+    <div id="cloudPaperStats" style="font-size:9.5px;color:var(--sub);margin-top:8px;padding-top:8px;border-top:1px solid var(--border)"></div>
+    <div style="font-size:10.5px;font-weight:600;margin-top:8px">Recently closed:</div>
+    <div id="cloudPaperHistory" style="font-size:10px;color:var(--sub);margin-top:2px;max-height:120px;overflow-y:auto"></div>
+    <div style="font-size:9px;color:var(--sub);margin-top:6px">This runs the SAME signal engine as real trading, scanning all 22 coins on Cloudflare's servers every ~3min — testing whether it would actually make money before you commit real capital. Starts at $10 to match a real deposit. (This is 1 of 3 separate bots: this Cloud one, the Local one below it, and the Real Auto-Trade Bot further down which uses actual money.)</div>
   </div>
 
   <div class="pt-stats">
@@ -490,6 +494,7 @@ select:focus,.form-row input:focus,.form-row select:focus{outline:2px solid rgba
   <div class="section-lbl" style="margin-top:12px">Positions</div>
   <div id="ptPositions"><div style="color:var(--sub);font-size:11px">No open positions.</div></div>
   <div class="section-lbl">History</div>
+  <div id="ptStats" style="font-size:9.5px;color:var(--sub);margin-bottom:6px"></div>
   <div id="ptHistory" class="scroll" style="max-height:160px"><div style="color:var(--sub);font-size:11px">No trade history.</div></div>
 </div>
 
@@ -597,6 +602,7 @@ select:focus,.form-row input:focus,.form-row select:focus{outline:2px solid rgba
       <div>
         <div style="font-size:12px;font-weight:700;color:var(--red)">🤖 Real Auto-Trade Bot</div>
         <div style="font-size:10px;color:var(--sub);margin-top:2px" id="realBotStatusText">Off — opens REAL leveraged trades automatically</div>
+        <div style="font-size:9px;color:var(--sub);margin-top:2px">Uses actual Binance money — separate from the two paper bots above (Cloud and Local), which only simulate.</div>
       </div>
       <label style="position:relative;display:inline-block;width:44px;height:24px;flex-shrink:0">
         <input type="checkbox" id="realAutoTradeToggle" style="opacity:0;width:0;height:0">
@@ -964,6 +970,45 @@ async function loadCloudPaperStatus(){
       statusLine=`⚠️ No scan recorded yet — deploy may not have completed, or cron hasn't ticked yet`;
     }
     document.getElementById('cloudPaperStatus').textContent=statusLine;
+
+    // 🆕 Show the actual OPEN positions, not just a count — with a live
+    // unrealized P&L estimate using whatever price this browser tab already
+    // has cached for that symbol (real-time only if you've had that coin's
+    // ticker loaded recently; otherwise shown using the last known price).
+    const posEl=document.getElementById('cloudPaperPositions');
+    const positions=acct.positions||[];
+    if(positions.length){
+      posEl.innerHTML=positions.map(p=>{
+        const live=state.prices[p.symbol];
+        let pnlTxt='<span style="color:var(--sub)">live price not cached in this tab</span>';
+        if(live){
+          const pnl=(p.side==='LONG'?(live-p.entry):(p.entry-live))*p.size/p.entry;
+          const color=pnl>=0?'var(--accent)':'var(--red)';
+          pnlTxt=`<span style="color:${color}">${pnl>=0?'+':''}${pnl.toFixed(3)}$ unrealized</span>`;
+        }
+        return `<div>${p.symbol} ${p.side} @ ${fmtPrice(p.entry)} — margin $${p.margin.toFixed(2)} — ${pnlTxt}</div>`;
+      }).join('');
+    } else {
+      posEl.innerHTML='<div>No open positions.</div>';
+    }
+
+    // 🆕 Gross win $ vs gross loss $ and profit factor — this is what
+    // actually tells you if the system has an edge, not eyeballing a
+    // handful of recent lines (small individual amounts can still add up
+    // to real growth if wins are bigger than losses on average).
+    const statsEl=document.getElementById('cloudPaperStats');
+    if(hist.length){
+      const grossWin=hist.filter(h=>h.pnl>0).reduce((a,h)=>a+h.pnl,0);
+      const grossLoss=Math.abs(hist.filter(h=>h.pnl<=0).reduce((a,h)=>a+h.pnl,0));
+      const pf=grossLoss>0?(grossWin/grossLoss).toFixed(2):'∞';
+      const avgWin=wins?(grossWin/wins):0;
+      const lossCount=hist.length-wins;
+      const avgLoss=lossCount?(grossLoss/lossCount):0;
+      statsEl.textContent=`Gross profit +$${grossWin.toFixed(2)} vs gross loss -$${grossLoss.toFixed(2)} → profit factor ${pf} (avg win $${avgWin.toFixed(3)}, avg loss $${avgLoss.toFixed(3)}, over ${hist.length} closed trades)`;
+    } else {
+      statsEl.textContent='';
+    }
+
     const histEl=document.getElementById('cloudPaperHistory');
     if(hist.length){
       histEl.innerHTML=hist.slice(0,8).map(h=>{
@@ -2581,6 +2626,20 @@ function renderPT(){
   document.getElementById('ptBalance').textContent='$'+state.ptBalance.toFixed(2);
   document.getElementById('ptWinRate').textContent=total?Math.round(wins/total*100)+'%':'0%';
   document.getElementById('ptOpenCount').textContent=state.ptOpen.length;
+
+  // 🆕 Gross win $ vs gross loss $ + profit factor — same audit view as the Cloud bot
+  const ptStatsEl=document.getElementById('ptStats');
+  if(ptStatsEl){
+    if(total){
+      const grossWin=state.ptHist.filter(t=>t.pnl>0).reduce((a,t)=>a+t.pnl,0);
+      const grossLoss=Math.abs(state.ptHist.filter(t=>t.pnl<=0).reduce((a,t)=>a+t.pnl,0));
+      const pf=grossLoss>0?(grossWin/grossLoss).toFixed(2):'∞';
+      const lossCount=total-wins;
+      ptStatsEl.textContent=`Gross profit +$${grossWin.toFixed(2)} vs gross loss -$${grossLoss.toFixed(2)} → profit factor ${pf} (avg win $${wins?(grossWin/wins).toFixed(3):'0'}, avg loss $${lossCount?(grossLoss/lossCount).toFixed(3):'0'}, over ${total} closed trades)`;
+    } else {
+      ptStatsEl.textContent='';
+    }
+  }
 
   document.getElementById('ptPositions').innerHTML=state.ptOpen.length
     ?state.ptOpen.map(t=>{
