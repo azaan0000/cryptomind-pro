@@ -708,9 +708,9 @@ const WATCHLIST = [
   {sym:'JTOUSDT',lbl:'JTO'},{sym:'JUPUSDT',lbl:'JUP'},
 ];
 const TF_BINANCE = {'5m':'5m','1h':'1h','4h':'4h','1d':'1d'};
-const TF_BYBIT   = {'5m':'5','1h':'60','4h':'240','1d':'D'};
-const TF_OKX     = {'5m':'5m','1h':'1H','4h':'4H','1d':'1D'};
-const TF_KUCOIN  = {'5m':'5min','1h':'1hour','4h':'4hour','1d':'1day'};
+const TF_BYBIT   = {'1m':'1','5m':'5','1h':'60','4h':'240','1d':'D'};
+const TF_OKX     = {'1m':'1m','5m':'5m','1h':'1H','4h':'4H','1d':'1D'};
+const TF_KUCOIN  = {'1m':'1min','5m':'5min','1h':'1hour','4h':'4hour','1d':'1day'};
 
 async function timedFetchW(url, ms) {
   const ctrl = new AbortController();
@@ -1028,6 +1028,17 @@ async function fetchKucoinCandlesW(symbol,tf,limit=200){
   if(list.length<20) throw new Error('bad');
   return list.map(c=>({time:+c[0],open:+c[1],close:+c[2],high:+c[3],low:+c[4],volume:+c[5]}));
 }
+// 🆕 Recent 1-minute candles for monitoring OPEN paper positions every tick,
+// regardless of which rotation group is being scanned. Lets SL/TP touches
+// between ticks be detected from candle highs/lows instead of only sampling
+// the price at the instant of a scan.
+async function fetchRecentCandlesW(symbol){
+  for(const fn of [fetchBybitCandlesW,fetchOkxCandlesW,fetchKucoinCandlesW]){
+    try{ const cs = await fn(symbol,'1m',30); if(cs&&cs.length) return cs.slice(-30); }catch(e){}
+  }
+  return null;
+}
+
 async function fetchCandlesW(symbol,tf){
   const errs=[];
   // 🛠️ FIX (2026-09-23): Binance confirmed (via live error log) to always
@@ -1134,6 +1145,23 @@ async function runAutoTradeScan(env){
   let topSignal = null; // 🆕 diagnostic: strongest signal seen this tick even if it didn't qualify — proves whether the engine is "seeing" strong setups
   const newsSentiment = await fetchNewsSentimentW(); // 🆕 market-wide, fetched once, same for every coin this tick
 
+  // 🆕 BTC market regime (experimental, 2026-09-28): the last batch of paper
+  // trades was all LONG stop-outs during a bearish market — alts mostly
+  // follow BTC, so a long on an alt while BTC's 1h trend is down is fighting
+  // the tide. Counter-regime entries are skipped (and counted in the log so
+  // it's visible how often this filter acts). One extra subrequest per tick.
+  let btcRegime = 'neutral';
+  try{
+    const btc1h = await fetchCandlesW('BTCUSDT','1h');
+    if(btc1h && btc1h.length>=60){
+      const cl = btc1h.map(c=>c.close);
+      const e20 = ema(cl,20), e50 = ema(cl,50), li = cl.length-1;
+      if(e20[li]<e50[li] && cl[li]<e50[li]) btcRegime='bear';
+      else if(e20[li]>e50[li] && cl[li]>e50[li]) btcRegime='bull';
+    }
+  }catch(e){}
+  let regimeBlocked = 0;
+
   // 🆕 SIGNAL STABILITY: load last tick's smoothed score/direction per symbol
   // (single KV read), update in-memory as each coin resolves, single KV
   // write at the end — cheap regardless of watchlist size.
@@ -1174,7 +1202,11 @@ async function runAutoTradeScan(env){
         topSignal = { symbol:coin.sym, direction:sig.direction, confidence:sig.confidence };
       }
       if(sig.direction!=='HOLD' && sig.confidence>=70){ // 🛠️ REVERTED (2026-09-09): back to 70
-        candidates.push({ symbol:coin.sym, ...sig });
+        if(coin.sym!=='BTCUSDT'&&((sig.direction==='LONG'&&btcRegime==='bear')||(sig.direction==='SHORT'&&btcRegime==='bull'))){
+          regimeBlocked++; // counter-regime entry skipped
+        } else {
+          candidates.push({ symbol:coin.sym, ...sig });
+        }
       }
     }catch(e){ /* one coin failing shouldn't stop the whole scan */ }
   }));
@@ -1187,12 +1219,12 @@ async function runAutoTradeScan(env){
   // genuine always-on background test of the exact same engine that would
   // place real orders, instead of only reacting to whatever coin happens to
   // be on-screen in the browser.
-  await runPaperSim(env, candidates, latestPrices, { successCount, topSignal }, fundingRates);
+  await runPaperSim(env, candidates, latestPrices, { successCount, topSignal, btcRegime, regimeBlocked }, fundingRates);
 
   if(!config.userId || !config.realAutoTrade || !config.riskAccepted) return; // real-money bot not enabled — paper sim above already ran, nothing more to do
 
   if(candidates.length===0){
-    await appendBotLog(env,{ scanned:scanGroup.length, group:`${groupIdx+1}/${numGroups}`, dataOk:successCount, qualifying:0, opened:0, top:topSignal, lastFetchErr:successCount===0?fetchCandlesW.lastError:undefined }); // 🆕 dataOk shows how many of this tick's group returned usable data; group shows which rotation slice this was; lastFetchErr reveals WHY when it's zero
+    await appendBotLog(env,{ scanned:scanGroup.length, group:`${groupIdx+1}/${numGroups}`, dataOk:successCount, qualifying:0, opened:0, top:topSignal, btcRegime, regimeBlocked, lastFetchErr:successCount===0?fetchCandlesW.lastError:undefined }); // 🆕 dataOk shows how many of this tick's group returned usable data; group shows which rotation slice this was; btcRegime/regimeBlocked show the new counter-trend filter in action; lastFetchErr reveals WHY when it's zero
     return;
   }
 
@@ -1331,15 +1363,32 @@ async function runPaperSim(env, candidates, latestPrices, diag, fundingRates){
   acct.lastScanAt = Date.now();
   acct.lastDataOk = diag ? diag.successCount : null;
   acct.lastTopSignal = diag ? diag.topSignal : null;
+  acct.lastBtcRegime = diag ? diag.btcRegime : null;
+  acct.lastRegimeBlocked = diag ? diag.regimeBlocked : null;
   changed = true;
 
   const fundingBoundary = lastFundingBoundary(Date.now()); // 🆕 real futures settle funding at 00:00/08:00/16:00 UTC
 
-  // 1) Check existing open paper positions for SL/TP/liquidation at current price
+  // 1) Check existing open paper positions for SL/TP/liquidation — 🛠️ FIX
+  // (2026-09-28): the rotation fix (scanning coins in groups of 4) meant an
+  // open position only got a fresh price when its group happened to be
+  // scanned — up to ~18 minutes between checks. By then price could have
+  // moved well past the SL with no cap applied, and a TP touch in between
+  // checks was invisible entirely. Open positions are now monitored EVERY
+  // tick regardless of rotation group, using recent 1-minute candle
+  // highs/lows (not just a point-sample), so a touch between ticks is
+  // caught at the level it actually touched.
   const stillOpen = [];
   for(const p of acct.positions){
-    const price = latestPrices[p.symbol];
-    if(!price){ stillOpen.push(p); continue; } // no fresh price this tick — leave it, check next tick
+    const recentCandles = await fetchRecentCandlesW(p.symbol);
+    let price = latestPrices[p.symbol];
+    let touchHigh = price, touchLow = price;
+    if(recentCandles && recentCandles.length){
+      price = recentCandles[recentCandles.length-1].close;
+      touchHigh = Math.max(...recentCandles.map(c=>c.high));
+      touchLow = Math.min(...recentCandles.map(c=>c.low));
+    }
+    if(!price){ stillOpen.push(p); continue; } // couldn't get any price this tick — leave it, check next tick
     const isLong = p.side==='LONG';
     const margin = p.margin;
 
@@ -1356,27 +1405,27 @@ async function runPaperSim(env, candidates, latestPrices, diag, fundingRates){
       p.lastFundingAt = fundingBoundary;
     }
 
-    // Partial TP1 (once)
+    // Partial TP1 (once) — checked against the candle range's favorable side, not just the latest close
     if(p.tp1 && p.tp2 && !p.scaledOut){
-      const hitTP1 = isLong ? price>=p.tp1 : price<=p.tp1;
+      const hitTP1 = isLong ? touchHigh>=p.tp1 : touchLow<=p.tp1;
       if(hitTP1){
         const halfSize = p.size/2;
         const pnl = halfSize*(Math.abs(p.tp1-p.entry)/p.entry);
         const exitFee = halfSize*PAPER_FEE_RATE;
         const marginBack = margin/2;
         acct.balance = +(acct.balance + pnl - exitFee + marginBack).toFixed(4);
-        acct.history.unshift({ symbol:p.symbol, side:p.side, entry:p.entry, exit:price, pnl:+(pnl-exitFee).toFixed(4), reason:'TP1 Hit (50% closed)', at: Date.now() });
+        acct.history.unshift({ symbol:p.symbol, side:p.side, entry:p.entry, exit:p.tp1, pnl:+(pnl-exitFee).toFixed(4), reason:'TP1 Hit (50% closed)', at: Date.now() });
         p.size = halfSize; p.margin = margin/2; p.sl = p.entry; p.tp = p.tp2; p.scaledOut = true;
         changed = true;
       }
     }
 
     const slLevel = p.sl, tpLevel = p.tp || p.tp1;
-    const hitSL = isLong ? price<=slLevel : price>=slLevel;
-    const hitTP = isLong ? price>=tpLevel : price<=tpLevel;
+    const hitSL = isLong ? touchLow<=slLevel : touchHigh>=slLevel;
+    const hitTP = isLong ? touchHigh>=tpLevel : touchLow<=tpLevel;
     if(hitSL || hitTP){
       let reason = p.scaledOut ? 'Final TP2 Hit' : (hitTP ? 'TP Hit' : 'SL Hit');
-      const exitPrice = hitSL ? (isLong ? price*(1-slippagePctFor(p.symbol)) : price*(1+slippagePctFor(p.symbol))) : price; // 🆕 stop-loss slippage — market orders on a fast move don't always fill exactly at the trigger; TP behaves more like a limit fill so no slippage applied there
+      const exitPrice = hitSL ? (isLong ? slLevel*(1-slippagePctFor(p.symbol)) : slLevel*(1+slippagePctFor(p.symbol))) : tpLevel; // 🛠️ FIX: base slippage on the level actually touched, not the tick's latest close — a wick can touch SL and recover within the same candle window
       let pnl = hitTP
         ? p.size*(Math.abs(tpLevel-p.entry)/p.entry)
         : -(p.size*(Math.abs(p.entry-exitPrice)/p.entry));

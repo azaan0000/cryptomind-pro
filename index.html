@@ -965,7 +965,8 @@ async function loadCloudPaperStatus(){
       const ago=secsAgo<90?`${secsAgo}s ago`:`${Math.round(secsAgo/60)}m ago`;
       const dataInfo=acct.lastDataOk!=null?`, data ok ${acct.lastDataOk}/22`:'';
       const topInfo=acct.lastTopSignal?`, strongest seen: ${acct.lastTopSignal.symbol} ${acct.lastTopSignal.direction} ${acct.lastTopSignal.confidence}%`:'';
-      statusLine=`✅ Last scan ${ago}${dataInfo}${topInfo} — ${(acct.positions||[]).length} open, ${hist.length} closed so far`;
+      const regimeInfo=acct.lastBtcRegime?`, BTC regime: ${acct.lastBtcRegime}${acct.lastRegimeBlocked?` (${acct.lastRegimeBlocked} counter-trend blocked)`:''}`:'';
+      statusLine=`✅ Last scan ${ago}${dataInfo}${topInfo}${regimeInfo} — ${(acct.positions||[]).length} open, ${hist.length} closed so far`;
     } else {
       statusLine=`⚠️ No scan recorded yet — deploy may not have completed, or cron hasn't ticked yet`;
     }
