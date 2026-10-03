@@ -2463,6 +2463,23 @@ function checkAllPaperTrades(){
       t.lastFundingAt=fb;
     }
 
+    // 🆕 PROFIT LOCK (2026-10-01): once price has moved 50% of the way from
+    // entry to TP1 without hitting it, tighten SL to lock in 30% of that
+    // move — stops a trade that got close to target from round-tripping
+    // all the way back to the original wider SL. Only ever tightens.
+    if(!t.scaledOut&&t.tp1){
+      if(t.peakFavorable==null) t.peakFavorable=t.entry;
+      if(isLong) t.peakFavorable=Math.max(t.peakFavorable,symPrice); else t.peakFavorable=Math.min(t.peakFavorable,symPrice);
+      const moveToTarget=Math.abs(t.tp1-t.entry);
+      const progressed=isLong?(t.peakFavorable-t.entry):(t.entry-t.peakFavorable);
+      if(moveToTarget>0&&progressed>=moveToTarget*0.5){
+        const lockAmount=progressed*0.3;
+        const candidateSL=isLong?t.entry+lockAmount:t.entry-lockAmount;
+        const tighter=isLong?candidateSL>t.sl:candidateSL<t.sl;
+        if(tighter){ t.sl=candidateSL; changed=true; }
+      }
+    }
+
     /* ── PARTIAL TP: if trade has tp1/tp2, take 50% at tp1, move SL to breakeven ── */
     if(t.tp1&&t.tp2&&!t.scaledOut){
       const hitTP1=isLong?symPrice>=t.tp1:symPrice<=t.tp1;

@@ -1405,6 +1405,24 @@ async function runPaperSim(env, candidates, latestPrices, diag, fundingRates){
       p.lastFundingAt = fundingBoundary;
     }
 
+    // 🆕 PROFIT LOCK (2026-10-01): if price has moved at least 50% of the way
+    // from entry toward TP1 but hasn't hit TP1 yet, tighten the SL to lock
+    // in part of that favorable move instead of leaving the full original
+    // (wider) SL distance exposed — addresses the pattern of trades getting
+    // most of the way to target then round-tripping all the way to a loss.
+    // Only ever tightens (moves favorably), never loosens.
+    if(!p.scaledOut && p.tp1){
+      const favorableTouch = isLong ? touchHigh : touchLow;
+      const moveToTarget = Math.abs(p.tp1-p.entry);
+      const progressed = isLong ? (favorableTouch-p.entry) : (p.entry-favorableTouch);
+      if(moveToTarget>0 && progressed >= moveToTarget*0.5){
+        const lockAmount = progressed*0.3; // lock in 30% of the best move seen so far
+        const candidateSL = isLong ? p.entry+lockAmount : p.entry-lockAmount;
+        const tighter = isLong ? candidateSL>p.sl : candidateSL<p.sl;
+        if(tighter){ p.sl = candidateSL; changed = true; }
+      }
+    }
+
     // Partial TP1 (once) — checked against the candle range's favorable side, not just the latest close
     if(p.tp1 && p.tp2 && !p.scaledOut){
       const hitTP1 = isLong ? touchHigh>=p.tp1 : touchLow<=p.tp1;
